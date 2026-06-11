@@ -1,0 +1,65 @@
+\colorlet{depthcolor}{palette8}
+\colorlet{widthcolor}{palette3}
+\colorlet{batchcolor}{darkpalette2}
+\colorlet{tokencolor}{palette1!70!palette4!70!black}
+\definecolor{changecolor}{HTML}{707070} %
+
+\newcommand{\mLalphamone}{\textcolor{depthcolor}{m_L^{\alpha-1}}}
+\newcommand{\mLmalpha}{\textcolor{depthcolor}{m_L^{-\alpha}}}
+\newcommand{\mNmone}{\textcolor{widthcolor}{m_N^{-1}}}
+\newcommand{\mNmtwo}{\textcolor{widthcolor}{m_N^{-2}}}
+\newcommand{\mNN}{\textcolor{widthcolor}{m_N}}
+\newcommand{\mBB}{\textcolor{batchcolor}{m_B}}
+\newcommand{\mDD}{\textcolor{tokencolor}{m_D}}
+\newcommand{\completepprevious}[1]{\hspace{1em}\tiny\textcolor{changecolor}{[#1]}}
+
+\begin{table}[t]
+\centering 
+ \captionsetup{skip=5pt} %
+\caption{\textbf{Parameterisation Comparison} as a function of  {\color{widthcolor}width ($m_N$)}, {\color{depthcolor}depth ($m_L$)}, {\color{batchcolor}batch size $(m_B)$} and {\color{tokencolor}token count/data size $(m_D)$} ratios. For \completedp, differences to CompleteP \citep{dey2025completep} for width \& depth scaling are shown alongside in \textcolor{changecolor}{gray}.}
+\label{tab:param_comparison}
+\begin{tabular}{rlrlll}
+\toprule
+& \textbf{Parameterisation:} & & \multicolumn{1}{c}{\textbf{$\mu$P (Table 3)}} & \multicolumn{2}{c}{\textbf{\completedp}} \\
+\midrule
+\multirow{3}{*}{\rotatebox[origin=c]{90}{\begin{tabular}{@{}c@{}}\itshape Multipliers\end{tabular}}}
+& MHA Residual &    & $\mathbf{x} + \text{\texttt{MHA}Block}(\mathbf{x})$     & \multicolumn{2}{l}{$\mathbf{x} + \mLmalpha \text{\texttt{MHA}Block}(\mathbf{x})$}     \\
+& MLP Residual  &   & $\mathbf{x} + \text{\texttt{MLP}Block}(\mathbf{x})$     & \multicolumn{2}{l}{$\mathbf{x} + \mLmalpha \text{\texttt{MLP}Block}(\mathbf{x})$}     \\
+& Unemb. Fwd     &  & \textit{Unaugmented}           & \multicolumn{2}{l}{\textit{Unaugmented}    \completepprevious{$\times (m_N^{-1})$}} \\
+\addlinespace
+\cmidrule{2-6}
+\addlinespace
+\multirow{5}{*}{\rotatebox[origin=c]{90}{\begin{tabular}{@{}c@{}}\itshape Init.\\\itshape Variances\end{tabular}}}
+& Input Emb.     & \multirow{5}{*}{$\sigma^2_\t{b}$}  &                &                \\
+& Hidden weights &  & $ \times \mNmone$ & $ \times \mNmone$ \\
+& Hidden biases/norms & &                &                \\
+& Unemb. LN      &  &                &                \\
+& Unemb. Weights &  & $ \times \mNmtwo$ & $ \times \mNmtwo$ \completepprevious{$\times 1$}\\
+\cmidrule{2-6}
+\multirow{5}{*}{\rotatebox[origin=c]{90}{\begin{tabular}{@{}c@{}}\itshape Learning\\\itshape Rates\end{tabular}}}
+& Input Emb.     & \multirow{5}{*}{$\eta_\t{b}$} &                   &  & \multirow{5}{*}{$\times \sqrt{\frac{\mBB}{\mDD}}$} \\
+& Hidden weights &  & $ \times \mNmone$      & $ \times \mNmone \times \mLalphamone$ \\
+& Hidden biases/norm & &                   & $ \times \mLalphamone$ \\
+& Unemb. LN      &  &                   &  \\
+& Unemb. weights &  & $ \times \mNmone$      & $ \times \mNmone$ \completepprevious{$\times 1$}\\
+\cmidrule{2-6}
+\multirow{4}{*}{\rotatebox[origin=c]{90}{\textit{AdamW $\epsilon$}}}
+& Hidden weights/biases/norms &\multirow{4}{*}{$\epsilon_\t{b}$} & $ \times \mNmone$ & $ \times \mNmone \times \mLmalpha$ & \multirow{4}{*}{$\times \sqrt{\frac{\mDD}{\mBB}}$} \\
+& QK norms        & & NA                                     & $ \times \mLmalpha$  \completepprevious{NA} & \\
+& Input Emb.      & & $ \times \mNmone$ & $ \times \mNmone$ \completepprevious{$\times 1$} & \\
+& Output weights/biases/norms & &                  &  & \\
+\cmidrule{2-6}
+\multirow{3}{*}{\rotatebox[origin=c]{90}{\begin{tabular}{@{}c@{}}\itshape Weight\\\itshape decay\end{tabular}}}
+& Hidden weights  & \multirow{3}{*}{$\lambda_\t{b}$} & $\times \mNN$                          & $\times \mNN$ & \multirow{3}{*}{$\times \sqrt{\frac{\mBB}{\mDD}}$} \\
+& Unemb. weights  & & $\times \mNN$                          & $\times \mNN$ \\
+& Rest            & & $\times 1$                              & $\times 1$ \\
+
+\cmidrule{2-6}
+\multicolumn{2}{l}{\textit{AdamW $(1-\beta_1)$}} & \multicolumn{2}{l}{$(1-\beta_{1,\t{b}})$} & & $\times \frac{\mBB}{\mDD}$ \\
+\multicolumn{2}{l}{\textit{AdamW $(1-\beta_2)$}} & \multicolumn{2}{l}{$(1-\beta_{2,\t{b}})$}  & & $\times \frac{\mBB}{\mDD}$ \\
+\cmidrule{1-6}
+\multicolumn{6}{c}{\textit{Training iterations} $\propto\frac{\mDD}{\mBB}$} \\
+
+\bottomrule
+\end{tabular}
+\end{table}

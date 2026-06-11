@@ -1,0 +1,181 @@
+\section{Hyperparameter transfer}
+In this section, we describe the hyperparameter transfer modalities we consider, and the principles that we follow to adjust HPs while varying other aspects of the training configuration.\footnote{
+    To disambiguate, we'll refer to \textit{hyperparameters} as aspects of training we want to find optimal values for, which we contrast with the \textit{training configuration} -- the aspects of training we want to control to facilitate scaling (number of training tokens, number of parameters, batch-size).
+}
+We first describe hyperparameter transfer in model size (width and depth) in \Cref{sec:hp-transfer-model-scale}, where we introduce a variant of the CompleteP parameterisation \citep{dey2025completep}.
+In \Cref{sec:hp-transfer-batch-size}, we describe principles we follow for hyperparameter transfer across batch-size.
+Lastly, we consider hyperparameter transfer in the number of training tokens in \Cref{sec:hp-transfer-tokens}, illustrating that optimal HPs do not transfer out of the box across token horizons. For an extended discussion of related work, see \Cref{app:related-work}.
+ 
+
+\paragraph{Experimental Setup} All experiments are conducted using a decoder-only transformer model \citep{radford2019language,phuong2022formalalgo} on the RedPajama dataset \citep{weber2024redpajama}.
+We use a modern transformer variant with pre-normalisation, Query-Key norms \citep{henry2020querykeynormalizationtransformers}, trained with a mixture of cross-entropy and Z-loss \citep{debrébisson2016zlossshiftscaleinvariant}.
+We always train with a cosine schedule.
+As a performance metric, we always report the final validation loss on the pre-training data, which is a strong indicator of downstream performance \citep{hoffmann2022computeoptimal,chen2025scaling}.
+For remaining training and architecture details, see \Cref{app:experimental-details}.
+
+\subsection{Hyperparameter transfer across model size}\label{sec:hp-transfer-model-scale}
+
+
+The core idea underlying hyperparameter transfer across models of different sizes is to view finite-size models as discretisations of the infinite-size limit.
+Intuitively, two models of different sizes that are both sufficiently close to the same infinite limit will behave similarly. If they are sufficiently close over a set of considered hyperparameters, then they should share similar optimal hyperparameters.
+
+The challenge is that, depending on the 
+\textit{parameterisation} --- i.e. the rules for adjusting the hyperparameters as a function of size --- we can obtain different infinite width or depth limits with fundamentally different behaviours \citep{yang2021featurelearning}.
+Most of these limits are pathological in various ways.
+For instance, the Standard Parameterisation (SP) \citep{sohl2020infinite}  leads to the features blowing up with size, whereas the Neural Tangent Parameterisation~\citep{jacot2018neural} results in a lack of \textit{feature learning}~\citep{yang2021featurelearning}.
+$\mu$P was identified by~\citet{yang2021featurelearning} as the unique parameterisation for Stochastic Gradient Descent (and later for a broad class of adaptive algorithms \citep{yang2023tensorprogramsivbadaptive}) that precludes the emergence of such pathologies at scale.
+
+In this work, we build upon CompleteP \citep{dey2025completep}, which itself is an adaptation of Depth-$\mu$P \citep{yang2024tensor} to transformers, to which we make several adaptations. These new scaling rules, which we call \textbf{\completedp}, are summarised in \Cref{tab:param_comparison}.
+\begin{figure}[t]
+    \centering
+    \includegraphics[]{figures/completep_all_transfer.pdf}
+    \captionsetup{skip=0pt}
+    \caption{Hyperparameter transfer for global learning rate across depth and width. \rev{Each setting is run with three independent seeds.}}
+    \label{fig:completedp-global-lr-hparam-transfer}
+\end{figure}
+Firstly, we extend the parameterisation to Query-Key (QK) normalisation layers 
+\citep{henry2020querykeynormalizationtransformers}, which have become a staple in modern transformer implementations~\citep{yang2025qwen3,dehghani2023scaling}. The challenge of QK norms is that, unlike any other component in transformers, these layers share weights across transformer heads. 
+If scaling in width is performed by increasing the number of heads while keeping the head dimension fixed (as was done in \citep{dey2025completep,yang2021featurelearning}), then QK norms introduce weight-sharing across the scaled dimensions.
+This necessitates different scaling considerations than for regular normalisation layer multipliers or biases.
+The adjustments for AdamW \citep{loshchilov2017decoupled} are shown in \Cref{tab:param_comparison}, which we justify in \Cref{sec:completedp-adjustments}.
+
+Secondly, we note that \citet{dey2025completep} mistakenly derived the wrong scaling for the AdamW $\epsilon$ scaling for the input embedding. We justify our modification in the \Cref{sec:completedp-adjustments}. Although the resulting modification is minor, we found that the lack thereof was sufficient to break a thorough sweep of the coordinate checks described by \citet{yang2022tensorprogramsvtuning} in our implementation.
+
+Lastly, we eliminate the explicit scalar multiplier on the output of the final linear projection by reparameterising its effect into the learning rate and initialisation scale.
+This enables easily incorporating memory-efficient algorithms like Cut Cross-Entropy \citep{wijmans2025cutcross}, which avoid materialising the full logit matrix, drastically reducing GPU memory requirements for modern large vocabulary models. 
+
+\input{completedp_table.tex}
+
+
+In \Cref{fig:completedp-global-lr-hparam-transfer}, we verify the HP transfer with \completedp across width and depth. An important factor in Depth-$\mu$P is the depth-dependent re-scaling factor for the residual connection in transformers ($\mathbf{h}^{\ell}$ the output of layer $\ell$, $\mathcal{F}_{\ell}$ the function applied to it):
+$$\mathbf{h}^{\ell+1} = \mathbf{h}^{\ell} + m_L^{-\alpha} \mathcal{F}_{\ell}(\mathbf{h}^{\ell}), \quad \ell \in \{1, \ldots, L\}$$
+which is governed by a single parameter $\alpha\in[0.5, 1]$.%
+We make the following observation:
+\begin{highlightbox}
+    \completedp with $\alpha=\frac{1}{2}$ and $\alpha=1$ permits hyperparameter transfer across depth.    
+\end{highlightbox}
+Our parameterisation seems to allow for HP transfer with all theoretically justified values of $\alpha \in \left[\frac{1}{2}, 1\right]$. This is in contrast to the findings of \citet{dey2025completep} who notice a degradation of transfer for $\alpha=0.5$.
+The added QK norms in our implementation improve stability (see \Cref{fig:completedp-transfer-no-qk-norms} for a comparison without); however, removing them does not lead to the breakdown of transfer reported by \citet{dey2025completep}. We note that in their publicly-released reference implementation, they apply the same AdamW's $\epsilon$ to all weights (including embeddings), against their own recommendation.
+Interestingly, the optimal loss is slightly better for the largest model for $\alpha=\frac{1}{2}$, potentially suggesting that the theoretical arguments for this parameterisation on the basis of \textit{feature diversity} \citep{yang2024tensor} might be beneficial in a language transformer context.
+
+
+
+
+
+
+
+
+\subsection{Hyperparameter transfer across batch-size}\label{sec:hp-transfer-batch-size}
+
+Model size and dataset size are two levers to achieve lower loss -- increasing each predictably leads to model improvements, as implied by scaling laws \citep{kaplan2020scalinglawsneurallanguage,hoffmann2022computeoptimal}.
+To avoid the training time blowing out of proportions, one typically wants to make use of extensive parallelisation, such as that controlled by the batch-size.
+However, the set of practically usable batch-sizes is often heavily constrained by the memory footprint of a model of a given size, and the specific parallel compute architecture available for training.
+In practice, the availability of compute can often change from month to month or week to week, requiring adjustments.
+Furthermore, these requirements might be different when tuning hyperparameters vs. when scaling up.
+For smaller hyperparameter sweep runs, a smaller batch-size is often desirable to reduce the per-run memory footprint and enable running parallel HP search.
+When training a larger model, one typically wants to adjust the batch-size to make use of all available compute for a single run.
+Unfortunately, as with scaling model size or training duration, hyperparameters do not transfer across batch-sizes without further reparameterisation. 
+In this work, we transfer hyperparameters across batch-size via a similar limiting argument as for transfer across model size. In particular, we follow the principles for batch-size transfer laid out in \citet{malladi2022sdes}, and extend them to weight-decay in AdamW.
+
+\textbf{Training as discretising an SDE}.
+The goal of the SDE reparameterisation approach is to parameterise hyperparameters such that training trajectories remain approximately invariant to batch-size changes when measured in "normalised time" (proportional to data observed).
+However, exact invariance is generally impossible.
+We therefore aim for invariance in the limit of infinitely small “effective” step sizes (step sizes in normalised time), where the discrete optimizer iterates (e.g., Adam or SGD) converge to a continuous stochastic process (often described by a Stochastic Differential Equation (SDE) \citep{malladi2022sdes}). By identifying the parameterisation that ensures a consistent and sensible SDE limit, we can derive reparameterisation rules where the optimizer acts as a stable discretisation of the same underlying process.
+Hyperparameters then transfer effectively across batch-sizes, provided the "effective step size" remains small enough for the discretisation to remain valid.
+
+\textbf{AdamW weight-decay reparameterisation}.
+We extend the parameterisation of \citet{malladi2022sdes}, which yields a consistent SDE limit for Adam, to handle the weight-decay in AdamW.
+To informally motivate the weight-decay scaling rule, we consider the same simplifying RMSPropW example as in \citet{malladi2022sdes}.
+We consider that the gradients queried at each step $k$ are a noisy version of a fixed direction $\boldsymbol{g}^k = \boldsymbol{g} + \sigma \boldsymbol{e}^k$, where $\boldsymbol{e}^k$ are i.i.d. Gaussian vectors of identity covariance.
+We note that as we move towards the small step size limit --- i.e. as the batch-size gets smaller and smaller --- the mini-batch gradient will be dominated by noise -- $\sigma \gg \|\boldsymbol{g}\|$.
+Contrary to \citet{malladi2022sdes}, we also consider a weight decay term as in AdamW.
+We denote $\eta$ the learning rate, and $\lambda$ the weight decay. 
+We obtain the simplified RMSProp iterations (see \citep[Sec. 4.1]{malladi2022sdes} for more details) that define the iterates $\boldsymbol{\theta}(k; \eta, \lambda, \sigma)$ with the equation
+\begin{equation}
+\label{eq:simple_rms_prop}
+    \boldsymbol{\theta}^{k+1}=\boldsymbol{\theta}^{k} - \eta \left(\frac{\boldsymbol{g}^k}{\sigma} + \lambda  \boldsymbol{\theta}^{k}\right) = \boldsymbol{\theta}^{k} - \frac{\eta}{\sigma}\left(\boldsymbol{g} + \lambda\sigma\boldsymbol{\theta}^{k}\right) - \eta \boldsymbol{e}^k,
+\end{equation}
+which is a discretization of the SDE $d\Theta_t = \frac{1}{\eta\sigma}(\boldsymbol{g} + \lambda\sigma\Theta_t)dt + dW_t$ with step-size $\eta^2$, in the sense that $\boldsymbol{\theta}^k\simeq \Theta_{k\eta^2}$.
+Therefore, we find that the multipliers to keep fixed iterate distributions, i.e., such that $\boldsymbol{\theta}(k; \eta, \lambda, \sigma) = \boldsymbol{\theta}(m_k k; m_\eta \eta,m_\lambda \lambda, m_\sigma \sigma)$, should verify $m_km_\eta^2 = 1,\enspace m_\eta m_\sigma=1,\text{ and }m_\lambda =m_\eta$.
+In particular, if the batch-size is multiplied by $\kappa$, we have $m_\sigma = \kappa^{-1/2}$ and we find that the new hyperparameters matching the SDE limit should follow the square-root scaling rule
+\begin{equation}
+    \label{eq:multipliers_bs}
+    \eta' = \sqrt{\kappa}\eta, \enspace k' =\kappa k,\text{ and }\lambda'= \sqrt{\kappa}\lambda\enspace.
+\end{equation}
+\rev{To the best of our knowledge, we are the first to extend the SDE reparametrisation scaling rules \citep{li2019stochastic,malladi2022sdes} to the weight decay of AdamW, although we note that the same scaling rule for weight decay was proposed based on other principles in recent work \citep{wang2025how,compagnoni2025adaptivemethodslenssdes,bergsma2025power}.}
+We report the effect of using these scaling rules in batch-size in \Cref{fig:hp-transfer-batch-size}; using the square-root rule is critical to good LR transfer. We further show in \Cref{fig:hp-transfer-weight-decay} that the above rule is essential for transfer of weight-decay in batch-size.
+
+\textbf{AdamLH and multipliers}
+\Cref{eq:simple_rms_prop} mirrors the Pytorch implementation of AdamW, where the weight decay $\lambda$ is multiplied by the learning rate $\eta$. If one instead uses the original AdamW implementation, often coined AdamLH, as proposed by~\citet{loshchilov2017decoupled}, we get the simplified iterations $\boldsymbol{\theta}^{k+1}=\boldsymbol{\theta}^{k} - \eta \frac{\boldsymbol{g}^k}{\sigma} - \lambda  \boldsymbol{\theta}^{k},$ and we find that the multipliers are the same as for AdamW, except that $m_\lambda = m_\eta^2$: doubling the batch-size means that the weight decay should now be doubled. 
+Hence, using AdamLH leads to a bigger drift across batch-sizes if the scaling is not done correctly, amplifying further the drift observed in \Cref{fig:hp-transfer-batch-size}, right. We posit that this is one of the reasons why the Pytorch implementation is more widely used.
+
+
+\begin{figure}[t]
+    \centering
+    \begin{subfigure}[b]{0.495\textwidth}
+        \includegraphics[width=\linewidth]{figures/learning_rate_sde_adjusted_batch_size_transfer.pdf}
+    \end{subfigure}
+    \begin{subfigure}[b]{0.495\textwidth}
+        \includegraphics[width=\linewidth]{figures/learning_rate_base__no_batch_size_transfer.pdf}
+    \end{subfigure}
+     \captionsetup{skip=-1pt} %
+    \caption{\textbf{Learning rate transfer with batch-size.} \textbf{Left:} Learning rates transfer when using the square-root rule in \Cref{eq:multipliers_bs} \textbf{Right:} Learning rates fail to transfer without adjustment. \rev{Each setting is run with three independent seeds.}} 
+    \label{fig:hp-transfer-batch-size}
+\end{figure}
+
+
+\begin{figure}[!htb]
+    \centering
+    \includegraphics[]{figures/weight_decay_rules.pdf}
+     \captionsetup{skip=-1pt} %
+    \caption{\textbf{Weight decay transfer with batch-size.} \textbf{Left:} Weight decay fails to transfer with batch-size without any adjustments. \textbf{Middle:} The rescaled (effective) weight decay $\lambda / \sqrt{\kappa}$ where $\kappa$ is the increase does transfer. \textbf{Right:} The effective weight decay transfers when rescaling all hyperparameters following our AdamW SDE scaling rule. \rev{Each setting is run with three independent seeds.}} 
+    \label{fig:hp-transfer-weight-decay}
+\end{figure}
+
+
+\subsection{Hyperparameter transfer in training duration}\label{sec:hp-transfer-tokens}
+\begin{figure}[!htb]
+    \centering
+    \includegraphics[]{figures/training_horizon_transfer.pdf}
+     \captionsetup{skip=-1pt} %
+    \caption{Learning rate transfer across training horizon -- adjusting the number of tokens by changing the number of training iterations while holding batch-size constant. \textbf{Left:} Break-down of transfer of the global learning rate. \textbf{Right:} Stability of the “effective” learning rate -- one that preserves the AdamW SDE integration horizon. \rev{Each setting is run with three independent seeds.}}
+    \label{fig:hp-non-transfer-num-iter}
+\end{figure}
+Unlike transfer in model size or batch-size, transfer in the token horizon has received comparatively less attention in the literature. Nonetheless, it is one of the two main levers to scaling compute.
+Like \citet{bjorck2025scalinghorizons}, we observe that the optimal learning rate decays with the number of training iterations, holding all other things constant.
+
+\textbf{Optimal learning rate decay with token horizon.} In~\Cref{fig:hp-non-transfer-num-iter}, we notice that the optimal learning rate decays at a rate roughly proportional to $\frac{1}{\sqrt{\kappa}}$, where $\kappa$ is the factor by which we've increased the number of training iterations.
+In \Cref{fig:hp-non-transfer-num-iter} \textit{(right)}, we plot the optimal learning rate from the shortest training duration ($\eta_\texttt{opt}$) transferred with the scaling rule $\frac{\eta_\texttt{opt}}{\sqrt{\kappa}}$ in \textcolor{gray}{gray}, and observe that it aligns almost perfectly with the true optima.
+In contrast, \citet{bjorck2025scalinghorizons} fit a scaling law to find the exponents $\beta$ for the scaling rule $\frac{\eta_\texttt{opt}}{\kappa^\beta}$; and they identify $\beta$ to be in the ranges of $0.3-0.7$ depending on the model size, which appears congruent with our scaling rule.
+
+\textbf{SDE iso-horizon scaling rule}. In light of the SDE interpretation in \Cref{sec:hp-transfer-batch-size}, scaling the learning rate by $\frac{1}{\sqrt{\kappa}}$ while holding the batch-size constant can be seen as reducing the signal-to-noise (SNR) ratio in the SDE, while keeping the time horizon constant.
+Indeed, we orthogonally observe that when simulating the AdamW SDE, improving the signal-to-noise ratio (i.e. reducing the size of the diffusion coefficient) while holding other parameters constant consistently leads to improved performance.
+Hence, we hypothesise that the right way to scale the token horizon might be only adjusting the signal-to-noise parameter in the AdamW SDE, while keeping all other terms constant.
+We validate this hypothesis in \Cref{fig:token-horizon-transfer-by-batch-size}, where we scale the number of tokens by increasing batch-size only (which has the desired effect of changing the signal-to-noise ratio); we observe a near-perfect learning rate transfer across the token horizon.
+We further observe that \textbf{the resulting scaling rule as a function of the token horizon leads to better asymptotic performance, as predicted by a scaling law}, as we demonstrate in \Cref{fig:scaling-law-sde-vs-no-sde}.
+
+
+\begin{highlightbox}
+    The SDE iso-horizon scaling rule empirically permits transfer across training horizon.
+\end{highlightbox}
+
+\begin{figure}
+    \centering
+    \includegraphics[width=0.9\linewidth]{figures/scaling_law_speedup_multiple_axes__completedp_sde_vs_completep.pdf}
+     \captionsetup{skip=-1pt} %
+    \caption{
+    \rev{
+    \textbf{Scaling law comparison of models trained with and without \completedp token horizon scaling rule}. We compare \completedp width \& depth scaling only (aka CompleteP with $\epsilon$ and QK-norm fixes in  \Cref{sec:hp-transfer-model-scale}) and full \completedp with SDE scaling rules for token horizon transfer. The token horizon transfer rule leads to better performance at scale, as indicated by a better lower bound coefficient of the scaling law.
+    }
+    }
+    \label{fig:scaling-law-sde-vs-no-sde}
+\end{figure}
+We expect this transfer to break at larger batch-sizes, where the discretisation will be too coarse for AdamW to approximate the underlying SDE, but when taken together with the batch-size reparameterisation rules in \Cref{sec:hp-transfer-batch-size}, this finding suggests how to scale all HPs across token horizons, while choosing the batch-size freely.
+This is the token horizon scaling procedure we follow in all the HP transfer results in the remainder of this paper, unless otherwise stated.
+We note that this finding might be specific to the fixed (cosine) schedule that we use.
+
+
+
+
+
+

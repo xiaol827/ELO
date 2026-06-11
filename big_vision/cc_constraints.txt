@@ -1,0 +1,3 @@
+sentencepiece==0.1.99
+flax==0.12.2
+distrax==0.1.7
