@@ -1,4 +1,11 @@
-# Welcome to (Efficient Long-hOrizon Learning)ELO!
+<div align="center">
+    
+# Efficient Long-Horizon Learning for Learned Optimization
+### (Jax version)
+<!-- 
+[![arXiv](https://img.shields.io/badge/arXiv-2410.06511-b31b1b.svg)](https://arxiv.org/abs/2506.10315) -->
+
+</div>
 
 ## Installation 
 Copy and run this single script to install everything:
@@ -130,10 +137,10 @@ pip install huggingface_hub
 mkdir -p data/fineweb_edu_10B
 python tools/download_dataset.py --output_dir data/fineweb_edu_10B --repo_id btherien/edufineweb-tokenized
 ```
-#### ImageNet-1K (224) for Big_vision
-See `big_vision/README.md`.
+#### Download ImageNet-1K (224x224) for Big_vision tasks
+Please refer to `big_vision/README.md`.
 
-## Usage (ELO-Celo2 as an example)
+## Usage (E.g. ELO-Celo2)
 
 ### Meta-training
 ```
@@ -196,7 +203,7 @@ truncated_step_args.kwargs.buffer_cfg.buffer_size=1 \
 This will automatically log training metrics and the learned optimizer weights to a W&B run. Be sure to record the **wandb_checkpoint_id** and use it to fill in **<NEED>** below.
 
 ### Image classification (ViT-Base/16, ImageNet-1K 224 resolution)
-
+On 4 H100:
 ```
 python3 -m big_vision.train_lo \
 --config big_vision/configs/vit_i1k_elo_celo2.py:variant=B/16,aug=strong8 \
@@ -217,20 +224,19 @@ python3 -m big_vision.train_lo \
 ```
 
 ### Language Modeling (GPT2 (350M), 7B Tokens)
-
+On 4 H100:
 ```
 srun bash -c 'OMP_NUM_THREADS=16 python src/main.py \
 --config config/meta_test/meta_test_base.py,\
 config/data/no_aug.py,\
 config/learned_optimizer/elo_celo2.py,\
-config/parameterization/complete_p_w64_bs64_sl16_steps1000.py,\
 config/gradient_transform/before/clip_by_global_norm.py,\
 config/gradient_transform/after/none.py \
 --cfg_options \
 learned_optimizer_args.kwargs.meta_train=False \
 learned_optimizer_args.kwargs.init_lr=0.0 \
-learned_optimizer_args.kwargs.peak_lr=0.0002 \
-learned_optimizer_args.kwargs.end_lr=2e-6 \
+learned_optimizer_args.kwargs.peak_lr=3.16e-4 \
+learned_optimizer_args.kwargs.end_lr=3.16e-5 \
 learned_optimizer_args.kwargs.weight_decay=0.1 \
 learned_optimizer_args.kwargs.adam_lr_mult=20 \
 learned_optimizer_args.kwargs.clip_grad=True \
@@ -239,17 +245,16 @@ learned_optimizer_args.kwargs.clip_norm=1.0 \
 --master_port $MASTER_PORT \
 --master_node $MASTER_ADDR \
 --num_runs 1 \
---local_batch_size 32 \
+--local_batch_size 16 \
 --ovr_test_batch_size 64 \
 --test_accumulate_steps 4 \
 --optimizer ELO_Celo2LOpt \
 --name_suffix elo_celo2_fb7B \
---num_inner_steps 13351 \
---gradient_accumulation_steps 8 \
+--num_inner_steps 26702 \
+--gradient_accumulation_steps 4 \
 --test_interval 20 \
 --needs_state \
---task "transformer-dense-w1024-d24-h16_fineweb-s512-gpt2" \
+--task "transformer-dense-w1024-d24-h16_fineweb-s1024-gpt2" \
 --wandb_checkpoint_id <NEED> \
---auto_resume \
 --save_iter 500'
 ```
