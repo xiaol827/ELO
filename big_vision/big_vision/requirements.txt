@@ -1,0 +1,21 @@
+numpy>=1.26
+absl-py
+git+https://github.com/google/CommonLoopUtils
+distrax
+editdistance
+einops
+flax
+optax
+git+https://github.com/google/flaxformer
+git+https://github.com/akolesnikoff/panopticapi.git@mute
+overrides
+protobuf
+sentencepiece
+# tensorflow-cpu==2.17.0
+# tensorflow==2.17.0+computecanada
+# tfds-nightly
+tensorflow-datasets
+# tensorflow-text
+# tensorflow-gan
+psutil
+pycocoevalcap

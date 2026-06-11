@@ -1,0 +1,5 @@
+augmentations = [
+    'flip',
+    'crop',
+    'translate'
+]
