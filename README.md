@@ -245,3 +245,14 @@ learned_optimizer_args.kwargs.clip_norm=1.0 \
 --wandb_checkpoint_id [NEED] \
 --save_iter 500'
 ```
+
+## Citation
+
+```bibtex
+@article{elo2025,
+  title   = {ELO: Efficient Long-Horizon Learning for Learned Optimization},
+  journal = {arXiv preprint arXiv:2506.10315},
+  year    = {2025},
+  url     = {https://arxiv.org/abs/2506.10315}
+}
+```
