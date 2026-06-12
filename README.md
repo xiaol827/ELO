@@ -89,57 +89,42 @@ source /path/to/l2o_install/setup.sh
 
 ## Download data
 
-Use the `download_all_datasets.sh` script to download datasets:
+All datasets live under `$TFDS_DATA_DIR` (set to `$PWD/data` by `setup.sh`).
+
+### Meta-training tasks (small image classification)
+
+The meta-training tasks — `mlp-w32-d1_mnist-8x8x1`, `mlp-w32-d1_fashionmnist-8x8x1`,
+`mlp-w32-d1_cifar10-8x8x3`, `mlp-w32-d1_svhn-8x8x3` — use the standard TFDS
+datasets, downscaled to 8×8 on the fly. Fetch them once:
 
 ```bash
-# Download all datasets
-./tools/download_all_datasets.sh
-
-# Download specific datasets (can combine multiple options)
-./tools/download_all_datasets.sh --imagenet32
-./tools/download_all_datasets.sh --imagenet32 --imagenet64 --lm1b
-
-# Specify custom data directory
-./tools/download_all_datasets.sh --data-dir /path/to/data --all
+python -m big_vision.tools.download_tfds_datasets mnist fashion_mnist cifar10 svhn_cropped
 ```
 
-### Available options
+### Meta-testing datasets
 
-| Option | Description |
-|--------|-------------|
-| `--all` | Download all datasets (default if no options specified) |
-| `--imagenet32` | Download ImageNet-32x32x3 |
-| `--imagenet64` | Download ImageNet-64x64x3 |
-| `--lm1b` | Download LM1B |
-| `--fineweb10b` | Download Fineweb-edu 10B |
-| `--fineweb100b` | Download Fineweb-edu 100B |
-| `--data-dir DIR` | Specify data directory (default: `./data`) |
-| `-h, --help` | Show help message |
-
-After downloading, set the environment variables:
 ```bash
-export TFDS_DATA_DIR=$PWD/data
-export WANDB_DIR=$PWD/wandb
-```
-
-### Manual download (individual datasets)
-
-#### ImageNet-1K (32)
-```
-pip install huggingface_hub
+# ImageNet-32 (image classification)
 python tools/download_dataset.py --output_dir data --repo_id btherien/imagenet-32x32x3
-```
 
-#### Fineweb-edu 10B
-```
-pip install huggingface_hub
+# Fineweb-edu 10B (language modeling)
 mkdir -p data/fineweb_edu_10B
 python tools/download_dataset.py --output_dir data/fineweb_edu_10B --repo_id btherien/edufineweb-tokenized
 ```
-#### Download ImageNet-1K (224x224) for Big_vision tasks
-Please refer to `big_vision/README.md`.
+
+### ImageNet-1K (224×224) for Big Vision tasks
+
+`imagenet2012` cannot be downloaded automatically. Manually place the official
+`ILSVRC2012_img_train.tar` and `ILSVRC2012_img_val.tar` into
+`$TFDS_DATA_DIR/downloads/manual/`, then build the TFDS records (~1h):
+
+```bash
+python -m big_vision.tools.download_tfds_datasets imagenet2012
+```
 
 ## Usage (E.g. ELO-Celo2)
+
+We meta-train on a single L40S GPU (~6.5h) and evaluate on 4 H100 by default.
 
 ### Meta-training
 ```
@@ -202,7 +187,6 @@ truncated_step_args.kwargs.buffer_cfg.buffer_size=1 \
 This will automatically log training metrics and the learned optimizer weights to a W&B run. Be sure to record the **wandb_checkpoint_id** and use it to fill in the **[NEED]** below.
 
 --------
-We evaluate all optimizers using 4 H100 by default.
 ### Image classification (ViT-Base/16, ImageNet-1K)
 ```
 python3 -m big_vision.train_lo \
