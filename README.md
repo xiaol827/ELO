@@ -2,7 +2,11 @@
     
 # Efficient Long-Horizon Learning for Learned Optimization
 ### (Meta-train and Evaluate in Jax)
-[![arXiv](https://img.shields.io/badge/arXiv-xxx-b31b1b.svg)](https://arxiv.org/abs/2506.10315)
+
+<p align="center">
+<a href="https://lmsys.org/blog/"><b>arXiv</b></a> |
+<a href="https://github.com/xiaol827/ELO-torch"><b>ELO-torch</b></a>
+</p>
 
 </div>
 
