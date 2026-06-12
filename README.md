@@ -119,7 +119,7 @@ python tools/download_dataset.py --output_dir data/fineweb_edu_10B --repo_id bth
 `$TFDS_DATA_DIR/downloads/manual/`, then build the TFDS records (~1h):
 
 ```bash
-python -m big_vision.tools.download_tfds_datasets imagenet2012
+cd big_vision/ && python -m big_vision.tools.download_tfds_datasets imagenet2012
 ```
 
 ## Usage (E.g. ELO-Celo2)
