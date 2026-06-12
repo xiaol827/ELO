@@ -1,9 +1,8 @@
 <div align="center">
     
 # Efficient Long-Horizon Learning for Learned Optimization
-### (Jax version)
-<!-- 
-[![arXiv](https://img.shields.io/badge/arXiv-2410.06511-b31b1b.svg)](https://arxiv.org/abs/2506.10315) -->
+### (Meta-train and Evaluate in Jax)
+[![arXiv](https://img.shields.io/badge/arXiv-xxx-b31b1b.svg)](https://arxiv.org/abs/2506.10315)
 
 </div>
 
@@ -190,7 +189,7 @@ truncated_step_args.kwargs.buffer_cfg.buffer_size=1 \
 --num_tasks 8 \
 --num_outer_steps 100000 \
 --local_batch_size 64 64 64 64 \
---train_project <NEED> \
+--train_project ELO-Celo2-meta-train \
 --optimizer ELO_Celo2LOpt \
 --needs_state \
 --name_suffix elo_celo2 \
@@ -200,15 +199,16 @@ truncated_step_args.kwargs.buffer_cfg.buffer_size=1 \
 --auto_resume \
 --image_dtype float32
 ```
-This will automatically log training metrics and the learned optimizer weights to a W&B run. Be sure to record the **wandb_checkpoint_id** and use it to fill in **<NEED>** below.
+This will automatically log training metrics and the learned optimizer weights to a W&B run. Be sure to record the **wandb_checkpoint_id** and use it to fill in the **[NEED]** below.
 
-### Image classification (ViT-Base/16, ImageNet-1K 224 resolution)
-On 4 H100:
+--------
+We evaluate all optimizers using 4 H100 by default.
+### Image classification (ViT-Base/16, ImageNet-1K)
 ```
 python3 -m big_vision.train_lo \
 --config big_vision/configs/vit_i1k_elo_celo2.py:variant=B/16,aug=strong8 \
 --config.wandb.name elo_celo2_in1k_vitb16_lr3.16e_5_strong8 \
---config.wandb_checkpoint_id <NEED> \
+--config.wandb_checkpoint_id [NEED] \
 --config.total_steps 50000 \
 --config.model.dtype_mm bfloat16 \
 --config.input.batch_size 2048 \
@@ -224,8 +224,7 @@ python3 -m big_vision.train_lo \
 ```
 
 ### Language Modeling (GPT2 (350M), 7B Tokens)
-On 4 H100:
-```
+```python
 srun bash -c 'OMP_NUM_THREADS=16 python src/main.py \
 --config config/meta_test/meta_test_base.py,\
 config/data/no_aug.py,\
@@ -241,7 +240,7 @@ learned_optimizer_args.kwargs.weight_decay=0.1 \
 learned_optimizer_args.kwargs.adam_lr_mult=20 \
 learned_optimizer_args.kwargs.clip_grad=True \
 learned_optimizer_args.kwargs.clip_norm=1.0 \
---test_project <NEED> \
+--test_project ELO-Celo2 \
 --master_port $MASTER_PORT \
 --master_node $MASTER_ADDR \
 --num_runs 1 \
@@ -255,6 +254,6 @@ learned_optimizer_args.kwargs.clip_norm=1.0 \
 --test_interval 20 \
 --needs_state \
 --task "transformer-dense-w1024-d24-h16_fineweb-s1024-gpt2" \
---wandb_checkpoint_id <NEED> \
+--wandb_checkpoint_id [NEED] \
 --save_iter 500'
 ```
