@@ -256,3 +256,9 @@ learned_optimizer_args.kwargs.clip_norm=1.0 \
   url     = {https://arxiv.org/abs/2506.10315}
 }
 ```
+
+## License
+
+This project is released under the Apache License 2.0 — see the [LICENSE](LICENSE) file for details.
+
+It vendors third-party components that retain their own licenses: [`big_vision`](big_vision/LICENSE) and [`learned_optimization`](learned_optimization/LICENSE) are both licensed under Apache 2.0 by Google LLC.
