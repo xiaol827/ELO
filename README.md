@@ -1,7 +1,6 @@
 <div align="center">
 
-# Efficient Long-Horizon Learning for Learned Optimization
-### (ELO)
+# Efficient Long-Horizon Learning for Learned Optimization<br>(ELO)
 
 [![arXiv](https://img.shields.io/badge/arXiv-2506.10315-b31b1b.svg)](https://arxiv.org/abs/2506.10315)
 [![Code Torch](https://img.shields.io/badge/Code-Torch-1f6feb.svg)](https://github.com/Belilovsky-Lab/pylo)
