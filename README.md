@@ -1,14 +1,32 @@
 <div align="center">
-    
-# Efficient Long-Horizon Learning for Learned Optimization
-### (Meta-train and Evaluate in Jax)
 
-<p align="center">
-<a href="https://lmsys.org/blog/"><b>arXiv</b></a> |
-<a href="https://github.com/xiaol827/ELO-torch"><b>ELO-torch</b></a>
-</p>
+# Efficient Long-Horizon Learning for Learned Optimization
+### (ELO)
+
+[![arXiv](https://img.shields.io/badge/arXiv-2506.10315-b31b1b.svg)](https://arxiv.org/abs/2506.10315)
+[![Code Torch](https://img.shields.io/badge/Code-Torch-1f6feb.svg)](https://github.com/Belilovsky-Lab/pylo)
+[![License](https://img.shields.io/badge/License-Apache--2.0-lightgrey.svg)](./LICENSE)
 
 </div>
+
+**ELO** is an efficient long-horizon meta-learning framework for learned optimization. With only <7 hours of meta-training on a single GPU, ELO enables learned optimizers to, for the first time, practically transfer from small-scale tasks to real vision and language pretraining, outperform well-tuned AdamW across diverse settings, and achieve competitive results with Muon on GPT-2 124M/350M pretraining.
+
+## Key Features
+
+- **Failure-aware resume buffer** — reallocates redundant meta-training compute toward longer failure regimes, scaling learned-optimizer meta-training to long inner problems
+- **Progressive teacher forcing** — decoupled, progressive expert supervision provides stable and generalizable meta-learning signals
+- **Outperforms hand-designed optimizers** — element-wise ELO-LOs outperform well-tuned AdamW and matrix-aware ELO-LOs remain competitive and even slightly surpass Muon
+- **Cheap to meta-train** — every ELO-LO is trained in under 7 GPU-hours
+
+## Usage in Pytorch
+
+This repository is for meta-training and evaluating in Jax. For downstream usage in **PyTorch**, please visit our [PyLO](https://github.com/Belilovsky-Lab/pylo) repo: drop-in LOs that load their meta-learned weights automatically from the Hugging Face Hub. To load a custom checkpoint, pass `hf_key="<user>/<repo>"` or a local `checkpoint_path=...`.
+
+| Optimizer | Weights |
+|:--|:--|
+| `ELO-CELO2` | [🤗 elo-celo2](https://huggingface.co/DiamondXL/elo-celo2) |
+| `ELO` | [🤗 elo-small_fc_lopt](https://huggingface.co/DiamondXL/elo) |
+
 
 ## Installation 
 Copy and run this single script to install everything:
@@ -211,7 +229,7 @@ python3 -m big_vision.train_lo \
 --resume
 ```
 
-### Language Modeling (GPT2 (350M), 7B Tokens)
+### Language Modeling (GPT2 (124M), 2.5B Tokens)
 ```python
 srun bash -c 'OMP_NUM_THREADS=16 python src/main.py \
 --config config/meta_test/meta_test_base.py,\
@@ -228,20 +246,21 @@ learned_optimizer_args.kwargs.weight_decay=0.1 \
 learned_optimizer_args.kwargs.adam_lr_mult=20 \
 learned_optimizer_args.kwargs.clip_grad=True \
 learned_optimizer_args.kwargs.clip_norm=1.0 \
+learned_optimizer_args.kwargs.warmup_fraction=0.05 \
 --test_project ELO-Celo2 \
 --master_port $MASTER_PORT \
 --master_node $MASTER_ADDR \
 --num_runs 1 \
---local_batch_size 16 \
+--local_batch_size 32 \
 --ovr_test_batch_size 64 \
 --test_accumulate_steps 4 \
 --optimizer ELO_Celo2LOpt \
---name_suffix elo_celo2_fb7B \
---num_inner_steps 26702 \
---gradient_accumulation_steps 4 \
+--name_suffix elo_celo2_fb2.5B \
+--num_inner_steps 19074 \
+--gradient_accumulation_steps 1 \
 --test_interval 20 \
 --needs_state \
---task "transformer-dense-w1024-d24-h16_fineweb-s1024-gpt2" \
+--task "transformer-dense-w768-d12-h12_fineweb-s1024-gpt2" \
 --wandb_checkpoint_id [NEED] \
 --save_iter 500'
 ```
