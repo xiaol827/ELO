@@ -278,6 +278,6 @@ learned_optimizer_args.kwargs.warmup_fraction=0.05 \
 
 ## License
 
-This project is released under the Apache License 2.0 — see the [LICENSE](LICENSE) file for details.
+This repository is released under the Apache License 2.0 — see the [LICENSE](LICENSE) file for details.
 
 This repository includes third-party components from [`big_vision`](big_vision/LICENSE) and [`learned_optimization`](learned_optimization/LICENSE), both of which are licensed under Apache 2.0 by Google LLC.
