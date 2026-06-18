@@ -5,7 +5,7 @@
 
 [![arXiv](https://img.shields.io/badge/arXiv-2506.10315-b31b1b.svg)](https://arxiv.org/abs/2506.10315)
 [![Code Torch](https://img.shields.io/badge/Code-Torch-1f6feb.svg)](https://github.com/Belilovsky-Lab/pylo)
-[![License](https://img.shields.io/badge/License-Apache--2.0-lightgrey.svg)](./LICENSE)
+[![License](https://img.shields.io/badge/License-Apache--2.0-yellow.svg)](./LICENSE)
 
 </div>
 
@@ -280,4 +280,4 @@ learned_optimizer_args.kwargs.warmup_fraction=0.05 \
 
 This project is released under the Apache License 2.0 — see the [LICENSE](LICENSE) file for details.
 
-It vendors third-party components that retain their own licenses: [`big_vision`](big_vision/LICENSE) and [`learned_optimization`](learned_optimization/LICENSE) are both licensed under Apache 2.0 by Google LLC.
+This repository includes third-party components from [`big_vision`](big_vision/LICENSE) and [`learned_optimization`](learned_optimization/LICENSE), both of which are licensed under Apache 2.0 by Google LLC.
