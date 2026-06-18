@@ -164,8 +164,15 @@ def _push_buffers_core(
   # state currently written above); if push is ever switched to write the
   # post-truncation state, snap_accumulator must switch to the post accumulator.
   if accumulator_buffer is not None:
-    new_acc_buf = _write_per_task_if(accumulator_buffer, snap_accumulator, slots,
-                                     push)
+    # Push is rare (struggled | any_done); skip the full num_tasks*theta write
+    # on the common no-push step. Equivalent to _write_per_task_if's masked
+    # no-op write, but avoids touching the buffer memory at all when nothing
+    # pushes.
+    new_acc_buf = jax.lax.cond(
+        jnp.any(push),
+        lambda: _write_per_task_if(accumulator_buffer, snap_accumulator, slots,
+                                   push),
+        lambda: accumulator_buffer)
   else:
     new_acc_buf = None
 
@@ -190,6 +197,49 @@ _push_buffers_pmap = jax.pmap(
     _push_buffers_core,
     in_axes=(0, 0, 0, 0, 0, 0, 0, 0, 0, None),
     static_broadcasted_argnums=(9,))
+
+
+@jax.jit
+def _resolve_restart_accum(reset_slot_stack, accumulator_buffer):
+  """Resolve the per-task buffer warm-restart accumulator (single jit dispatch).
+
+  reset_slot_stack: [steps, num_tasks] int32 — -1 on train / random-init steps,
+    the restored slot index on a buffer warm-restart. For each task we take the
+    last warm-restart this truncation and read that slot's stored accumulator;
+    tasks that never warm-restarted get 0, so the downstream reset reduces to
+    vec_pos exactly (original behavior).
+  accumulator_buffer: pytree, leaves [num_tasks, buffer_size, *theta_leaf].
+  Returns restart_accum: pytree, leaves [num_tasks, *theta_leaf].
+
+  Folded into one jit so the per-leaf gather is a single fused dispatch instead
+  of one eager kernel per theta leaf, and `lax.cond` skips the gather entirely
+  on the common step where no task warm-restarted from the buffer.
+  """
+  num_tasks = reset_slot_stack.shape[1]
+  buffer_mask = reset_slot_stack >= 0
+  any_buffer = jnp.any(buffer_mask, axis=0)  # [num_tasks]
+  step_ids = jnp.arange(reset_slot_stack.shape[0])[:, None]
+  last_step = jnp.maximum(
+      jnp.max(jnp.where(buffer_mask, step_ids, -1), axis=0), 0)
+  last_slot = jnp.where(
+      any_buffer, reset_slot_stack[last_step, jnp.arange(num_tasks)],
+      0).astype(jnp.int32)
+
+  def _gather_leaf(buf_leaf):  # buf_leaf: [num_tasks, buffer_size, *]
+    g = jax.vmap(
+        lambda b, s: jax.lax.dynamic_index_in_dim(b, s, axis=0,
+                                                  keepdims=False))(
+            buf_leaf, last_slot)  # [num_tasks, *]
+    mask = any_buffer.reshape((num_tasks,) + (1,) * (g.ndim - 1))
+    return jnp.where(mask, g, jnp.zeros_like(g))
+
+  def _zeros_leaf(buf_leaf):
+    return jnp.zeros((num_tasks,) + buf_leaf.shape[2:], buf_leaf.dtype)
+
+  return jax.lax.cond(
+      jnp.any(any_buffer),
+      lambda: jax.tree_util.tree_map(_gather_leaf, accumulator_buffer),
+      lambda: jax.tree_util.tree_map(_zeros_leaf, accumulator_buffer))
 
 
 @flax.struct.dataclass
@@ -767,25 +817,11 @@ class TruncatedPES_ELO(gradient_learner.GradientEstimator):
     # For each task we take the last warm-restart this truncation and read that
     # slot's stored accumulator; tasks that never warm-restarted get 0, so the
     # downstream reset reduces to vec_pos exactly (original behavior).
+    # Single fused/jitted dispatch (see _resolve_restart_accum): collapses the
+    # former per-leaf eager gather and skips it entirely when no task
+    # warm-restarted this truncation.
     reset_slot_stack = jnp.concatenate([y.reset_slot for y in p_yses], axis=0)
-    num_tasks = reset_slot_stack.shape[1]
-    buffer_mask = reset_slot_stack >= 0
-    any_buffer = jnp.any(buffer_mask, axis=0)  # [num_tasks]
-    step_ids = jnp.arange(reset_slot_stack.shape[0])[:, None]
-    last_step = jnp.max(jnp.where(buffer_mask, step_ids, -1), axis=0)
-    last_step = jnp.maximum(last_step, 0)
-    last_slot = reset_slot_stack[last_step, jnp.arange(num_tasks)]
-    last_slot = jnp.where(any_buffer, last_slot, 0).astype(jnp.int32)
-
-    def _gather_restart(buf_leaf):  # buf_leaf: [num_tasks, buffer_size, *]
-      g = jax.vmap(
-          lambda b, s: jax.lax.dynamic_index_in_dim(b, s, axis=0,
-                                                    keepdims=False))(
-              buf_leaf, last_slot)  # [num_tasks, *]
-      mask = any_buffer.reshape((num_tasks,) + (1,) * (g.ndim - 1))
-      return jnp.where(mask, g, jnp.zeros_like(g))
-
-    restart_accum = jax.tree_util.tree_map(_gather_restart, accumulator_buffer)
+    restart_accum = _resolve_restart_accum(reset_slot_stack, accumulator_buffer)
 
     # Post-truncation push: write pos/neg inner states to buffer when the
     # trajectory struggled (CUSUM mean-max rose) or any reset fired this segment.
