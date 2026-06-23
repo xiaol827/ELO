@@ -13,8 +13,8 @@
 ## Key Features
 
 - **Failure-aware resume buffer** — reallocates redundant meta-training compute toward longer failure regimes, scaling learned-optimizer meta-training to long inner problems
-- **Progressive teacher forcing** — decoupled, progressive expert supervision provides stable and generalizable meta-learning signals
-- **Outperforms hand-designed optimizers** — element-wise ELO-LOs outperform well-tuned AdamW and matrix-aware ELO-LOs remain competitive and even slightly surpass Muon
+- **Progressive teacher forcing** — enforces decoupled progressive expert supervision, providing stable meta-learning signals that additionally lead to generalizable LOs
+- **Outperforms hand-designed optimizers** — element-wise ELO-LOs outperform well-tuned AdamW and matrix-aware ELO-LOs remain competitive with Muon
 - **Cheap to meta-train** — every ELO-LO is trained in under 7 GPU-hours
 
 ## Usage in Pytorch
