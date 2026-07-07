@@ -4,7 +4,7 @@
 
 [![arXiv](https://img.shields.io/badge/arXiv-2506.10315-b31b1b.svg)](https://arxiv.org/abs/2506.10315)
 [![Code Torch](https://img.shields.io/badge/Code-Torch-1f6feb.svg)](https://github.com/Belilovsky-Lab/pylo)
-[![Project Page](https://img.shields.io/badge/Project-Page-brightgreen.svg)](https://xiaol827.github.io/ELO-page/)
+[![Project Page](https://img.shields.io/badge/Project-Page-yellow.svg)](https://xiaol827.github.io/ELO-page/)
 
 </div>
 
