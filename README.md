@@ -17,6 +17,10 @@
 - **Outperforms hand-designed optimizers** — ELO-Celo2 outperforms well-tuned AdamW across all benchmarks and remains competitive with Muon on language modeling.
 - **Cheap to meta-train** — every ELO-LO is trained in under 7 GPU-hours
 
+<div align="center">
+  <img src="assets/meta_train_eff_with_lm.png" width="95%" alt="Left: ELO-Celo2 matches Muon and outperforms AdamW on GPT2 (350M) FineWeb pretraining. Right: ELO meta-training converges to lower meta-eval loss than other baselines.">
+</div>
+
 ## Usage in Pytorch
 
 This repository is for meta-training and evaluating in Jax. For downstream usage in **PyTorch**, please visit our [PyLO](https://github.com/Belilovsky-Lab/pylo) repo: drop-in LOs that load their meta-learned weights automatically from the Hugging Face Hub. To load a custom checkpoint, pass `hf_key="<user>/<repo>"` or a local `checkpoint_path=...`.
