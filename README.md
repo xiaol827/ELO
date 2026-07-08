@@ -8,7 +8,7 @@
 
 </div>
 
-**ELO** is an efficient long-horizon meta-learning framework for learned optimization. With only <7 hours of meta-training on a single GPU, ELO enables learned optimizers to practically transfer from small-scale tasks to practical vision and language pretraining, outperform well-tuned AdamW across multiple tasks, and achieve competitive results with Muon on GPT-2 124M/350M pretraining.
+**ELO** is an efficient long-horizon meta-learning framework for learned optimization. With only <7 hours of meta-training on a single GPU, ELO enables learned optimizers to transfer from small-scale tasks to practical vision and language pretraining, outperform well-tuned AdamW across multiple tasks, and achieve competitive results with Muon on GPT-2 124M/350M pretraining.
 
 ## Key Features
 
