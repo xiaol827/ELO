@@ -2,13 +2,13 @@
 
 # Efficient Long-Horizon Learning for Learned Optimization<br>(ELO)
 
-[![arXiv](https://img.shields.io/badge/arXiv-2506.10315-b31b1b.svg)](https://arxiv.org/abs/2506.10315)
+[![arXiv](https://img.shields.io/badge/arXiv-2506.10315-b31b1b.svg)](https://arxiv.org/abs/26.07)
 [![Code Torch](https://img.shields.io/badge/Code-Torch-1f6feb.svg)](https://github.com/Belilovsky-Lab/pylo)
 [![Project Page](https://img.shields.io/badge/Project-Page-yellow.svg)](https://xiaol827.github.io/ELO-page/)
 
 </div>
 
-**ELO** is an efficient long-horizon meta-learning framework for learned optimization. With only <7 hours of meta-training on a single GPU, ELO enables learned optimizers to, for the first time, practically transfer from small-scale tasks to real vision and language pretraining, outperform well-tuned AdamW across multiple tasks, and achieve competitive results with Muon on GPT-2 124M/350M pretraining.
+**ELO** is an efficient long-horizon meta-learning framework for learned optimization. With only <7 hours of meta-training on a single GPU, ELO enables learned optimizers to practically transfer from small-scale tasks to practical vision and language pretraining, outperform well-tuned AdamW across multiple tasks, and achieve competitive results with Muon on GPT-2 124M/350M pretraining.
 
 ## Key Features
 
