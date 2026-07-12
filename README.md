@@ -271,16 +271,10 @@ learned_optimizer_args.kwargs.warmup_fraction=0.05 \
 ## Citation
 
 ```bibtex
-@article{elo2025,
-  title   = {ELO: Efficient Long-Horizon Learning for Learned Optimization},
-  journal = {arXiv preprint arXiv:2506.10315},
-  year    = {2025},
-  url     = {https://arxiv.org/abs/2506.10315}
+@article{huang2026efficient,
+  title={Efficient Long-Horizon Learning for Learned Optimization},
+  author={Huang, Xiaolong and Th{\'e}rien, Benjamin and Harrison, James and Belilovsky, Eugene},
+  journal={arXiv preprint arXiv:2607.06772},
+  year={2026}
 }
 ```
-
-## License
-
-This repository is released under the Apache License 2.0 — see the [LICENSE](LICENSE) file for details.
-
-This repository includes third-party components from [`big_vision`](big_vision/LICENSE) and [`learned_optimization`](learned_optimization/LICENSE), both of which are licensed under Apache 2.0 by Google LLC.
