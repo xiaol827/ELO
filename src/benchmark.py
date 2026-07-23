@@ -114,9 +114,8 @@ def setup_completed_p_parameterization(args, task, params, state, key):
     )
 
     # Select parameterization class based on optimizer OR parameterization_class routing key.
-    # The routing key is set by Muon-aware configs (e.g. complete_p_bs100k_steps2000_muon.py)
-    # and is required for learned-Muon optimizers like MuCompletedPMuonLOpt that don't have
-    # 'mup_muon' in args.optimizer.
+    # The routing key is set by Muon-aware configs and is required for learned-Muon
+    # optimizers that don't have 'mup_muon' in args.optimizer.
     _param_class_key = (args.parameterization_args.get('parameterization_class') or '').lower()
     use_muon_param = (args.optimizer.lower() == 'mup_muon') or (_param_class_key == 'muon_completedp')
     ParamClass = MuonCompletedPParameterization if use_muon_param else CompletedPParameterization
@@ -186,7 +185,7 @@ def setup_completed_p_parameterization(args, task, params, state, key):
         state['muon_lr_scales'] = muon_lr_scales
         state['muon_eps_scales'] = muon_eps_scales
 
-        # New keys consumed by MuCompletedPMuonLOpt (with mup_ prefix).
+        # New keys consumed by learned-Muon optimizers (with mup_ prefix).
         # Mirrors mu_task_base._compute_completed_p_scales (the meta-train path).
         state['mup_muon_lr_scales'] = muon_lr_scales
         state['mup_muon_eps_scales'] = muon_eps_scales

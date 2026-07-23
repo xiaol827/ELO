@@ -14,15 +14,12 @@ from truncated_es_single_custom_elo import ESSingle_ELO
 from lopt_truncated_step_chen import VectorizedLOptTruncatedStep_CHEN
 from truncated_pes_custom_chen import TruncatedPES_CHEN
 from learned_optimization.learned_optimizers.adafac_mlp_lopt import AdafacMLPLOpt
-from learned_optimization.learned_optimizers.rnn_mlp_lopt import RNNMLPLOpt
-from fed_truncated_step import VectorizedFedLOptTruncatedStep
 from helpers import Timing, convert_config_to_dict
 from optimizers import AdamWLinearCosine, AdamW
 from opt import AnyOptimizer
 from opt.new_optimizers import get_optax_schedule, DoubleAdam
 from learned_optimization.outer_trainers.lopt_truncated_step import VectorizedLOptTruncatedStep
 from learned_optimization.outer_trainers.truncation_schedule import TruncationSchedule, ConstantTruncationState, ConstantTruncationSchedule
-from learned_optimization.research.general_lopt.hyper_v2 import HyperV2
 from learned_optimization.outer_trainers import (
     truncated_pes,
     truncation_schedule,
@@ -55,7 +52,6 @@ GRADIENT_ESTIMATORS = {
 }
 
 TRUNCATED_STEPS = {
-    "VectorizedFedLOptTruncatedStep".lower(): VectorizedFedLOptTruncatedStep,
     "VectorizedLOptTruncatedStep_ELO".lower(): VectorizedLOptTruncatedStep_ELO,
     "VectorizedLOptTruncatedStep_CHEN".lower(): VectorizedLOptTruncatedStep_CHEN,
     "VectorizedLOptTruncatedStep".lower(): VectorizedLOptTruncatedStep,
