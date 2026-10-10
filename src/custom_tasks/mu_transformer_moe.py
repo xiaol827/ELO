@@ -50,6 +50,51 @@ else:
 Initializer = Callable[[PRNGKey, Sequence[int], Any], Any]
 
 
+_COMPUTE_DTYPES = {None: None, 'float32': jnp.float32, 'bfloat16': jnp.bfloat16}
+
+
+def masked_next_token_loss(logits, targets, mask):
+  """Mean next-token cross entropy over positions where `mask` is True.
+
+  Equivalent to -sum(one_hot(targets) * log_softmax(logits)) but reads a single
+  log-probability per token instead of materializing a [B, L, V] one_hot tensor.
+  The loss is always evaluated in float32.
+  """
+  log_probs = jax.nn.log_softmax(logits.astype(jnp.float32), axis=-1)
+  nll = -jnp.take_along_axis(log_probs, targets[..., None], axis=-1)[..., 0]
+  mask = mask.astype(nll.dtype)
+  return jnp.sum(nll * mask) / jnp.sum(mask)
+
+
+@functools.partial(jax.custom_vjp, nondiff_argnums=(2,))
+def project_logits(x, w, compute_dtype):
+  """x[..., D] @ w[D, V] with compute_dtype operands and a float32 result.
+
+  The backward pass casts the float32 logits cotangent to compute_dtype so both
+  backward matmuls (dx and dw) also run with compute_dtype operands; dw is
+  accumulated into w.dtype (the float32 master param).
+  """
+  return jnp.dot(x.astype(compute_dtype), w.astype(compute_dtype),
+                 preferred_element_type=jnp.float32)
+
+
+def _project_logits_fwd(x, w, compute_dtype):
+  return project_logits(x, w, compute_dtype), (x, w)
+
+
+def _project_logits_bwd(compute_dtype, residuals, g):
+  x, w = residuals
+  g_c = g.astype(compute_dtype)
+  x_c = x.astype(compute_dtype)
+  dx = jnp.dot(g_c, w.astype(compute_dtype).T, preferred_element_type=x.dtype)
+  dw = jnp.dot(x_c.reshape(-1, x_c.shape[-1]).T, g_c.reshape(-1, g_c.shape[-1]),
+               preferred_element_type=w.dtype)
+  return dx, dw
+
+
+project_logits.defvjp(_project_logits_fwd, _project_logits_bwd)
+
+
 class KernelParam(nn.Module):
   """Holds a bare kernel parameter without computing a matmul.
 
@@ -73,6 +118,8 @@ class RMSNorm(nn.Module):
   weight_dtype: Any = jnp.float32
   kernel_axes: Tuple[Optional[str], ...] = ()
   scale_init: Initializer = nn.initializers.ones
+  # False -> no learnable gain (no param is created), as in the celo2 LM tasks.
+  use_scale: bool = True
 
   @nn.compact
   def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
@@ -81,6 +128,8 @@ class RMSNorm(nn.Module):
     features = x.shape[-1]
     mean2 = jnp.mean(lax.square(x), axis=-1, keepdims=True)
     y = jnp.asarray(x * lax.rsqrt(mean2 + self.epsilon), self.dtype)
+    if not self.use_scale:
+      return y
     scale = self.param(
         "scale",
         self.scale_init,
@@ -156,9 +205,16 @@ class DoConfig:
   V: int  # vocab size
   F: int  # FF inner dimension
   use_qk_norm: bool = False
+  # Learnable RMSNorm gain on every norm (block, qk, output). False drops all of
+  # them; the parameter tree then has no RMSNorm/out_ln entries at all.
+  use_norm_scale: bool = True
   ffn_type: str = 'regular_ffn'
   moe_config: MoeConfig = None
   dtype: jnp.dtype = jnp.float32
+  # Matmul operand dtype of the dense transformer layers (bf16 mixed precision when
+  # set to bfloat16). Params, residual stream and normalization statistics always
+  # stay in `dtype`. None -> same as `dtype`.
+  compute_dtype: Any = None
   fsdp_enabled: bool = False
 
   # Transformer block rematerialization / gradient checkpointing to save memory.
@@ -212,6 +268,8 @@ class DoConfig:
 
     self.depth = self.N
     self.width = self.D
+    if self.compute_dtype is None:
+      self.compute_dtype = self.dtype
 
     device = jax.devices()[jax.process_index()]
 
@@ -1100,23 +1158,18 @@ class TransformerDo(nn.Module):
           embedding_init=cfg.embed_init,
       )
 
-    # Optional output projection for untied weights
+    # Optional output projection for untied weights (param path output_proj/kernel)
     self.tie_weights = getattr(cfg, 'tie_weights', False)
     if not self.tie_weights:
-      self.output_proj = nn.Dense(
-          features=cfg.V,
-          use_bias=False,
-          kernel_init=cfg.output_proj_init,
-          dtype=cfg.dtype,
-          name='output_proj'
-      )
+      self.output_proj = KernelParam(shape=(cfg.D, cfg.V), kernel_init=cfg.output_proj_init, dtype=cfg.dtype)
 
     # Hidden layers: Transformer blocks
     block = nn.remat(TBlock) if cfg.remat else TBlock
     self.blocks = [block(cfg) for _ in range(cfg.N)]
-    
+
     # Output RMS norm - Use centralized norm initialization and epsilon
-    self.out_ln = RMSNorm(dtype=cfg.dtype, scale_init=cfg.norm_scale_init, epsilon=cfg.epsilon)
+    self.out_ln = RMSNorm(dtype=cfg.compute_dtype, scale_init=cfg.norm_scale_init, epsilon=cfg.epsilon,
+                          use_scale=cfg.use_norm_scale)
 
   # def get_mup_lrs(self, params, device):
   #   return jax.tree_util.tree_map(lambda x: jnp.array([1.0], device=device), params)
@@ -1158,13 +1211,12 @@ class TransformerDo(nn.Module):
     self.sow("intermediates", "load_balance_loss", total_load_balance_loss)
     
     y_BxLxD = self.out_ln(y_BxLxD)
-    
-    # Use either tied weights (embedding.attend) or separate output projection
-    if self.tie_weights:
-      logits_BxLxV = self.embed.attend(y_BxLxD.astype(jnp.float32))
-    else:
-      logits_BxLxV = self.output_proj(y_BxLxD)
-      
+
+    # Tied (embedding^T) or separate output projection; logits come out in float32
+    # for the loss while both forward and backward matmuls use compute_dtype operands.
+    w_DxV = self.embed.embedding.T if self.tie_weights else self.output_proj()
+    logits_BxLxV = project_logits(y_BxLxD, w_DxV, cfg.compute_dtype)
+
     return logits_BxLxV
 
 
@@ -1176,10 +1228,11 @@ class Mlp(nn.Module):
   def __call__(self, x_BxLxD: jax.Array):
     cfg = self.cfg
     D = x_BxLxD.shape[-1]
+    cd = cfg.compute_dtype
     up_kernel = KernelParam(shape=(D, cfg.F), kernel_init=cfg.hidden_kernel_init_std, dtype=cfg.dtype, name='Dense_0')()
     down_kernel = KernelParam(shape=(cfg.F, cfg.D), kernel_init=cfg.hidden_kernel_layer_init, dtype=cfg.dtype, name='Dense_1')()
-    x_BxLxF = jax.nn.gelu(x_BxLxD @ up_kernel)
-    x_BxLxD = x_BxLxF @ down_kernel
+    x_BxLxF = jax.nn.gelu(x_BxLxD.astype(cd) @ up_kernel.astype(cd))
+    x_BxLxD = x_BxLxF @ down_kernel.astype(cd)
     return x_BxLxD
 
 
@@ -1198,6 +1251,7 @@ class MlpSwiGLU(nn.Module):
   def __call__(self, x_BxLxD: jax.Array, pre_norm_input: jax.Array = None,
                norm_scale: jax.Array = None):
     cfg = self.cfg
+    cd = cfg.compute_dtype
     D = x_BxLxD.shape[-1]
 
     # Create params matching original Dense_0/kernel, Dense_1/kernel, Dense_2/kernel paths
@@ -1208,19 +1262,19 @@ class MlpSwiGLU(nn.Module):
     # Fused up+gate kernel
     combined_kernel = jnp.concatenate([up_kernel, gate_kernel], axis=-1)  # [D, 2F]
 
-    # Fused RMSNorm+Linear or standard matmul
+    # Fused RMSNorm+Linear or standard matmul (operands in compute_dtype)
     if pre_norm_input is not None and norm_scale is not None:
       # Fused path: RMSNorm(pre_norm_input) @ combined_kernel via custom_vjp
-      combined = fused_rmsnorm_linear(pre_norm_input, norm_scale, combined_kernel, cfg.epsilon)
+      combined = fused_rmsnorm_linear(pre_norm_input, norm_scale, combined_kernel, cfg.epsilon, cd)
     else:
       # Standard path: x is already normalized
-      combined = x_BxLxD @ combined_kernel  # [B, L, 2F]
+      combined = x_BxLxD.astype(cd) @ combined_kernel.astype(cd)  # [B, L, 2F]
 
     x_BxLxF = combined[..., :cfg.F]
     gate_BxLxF = combined[..., cfg.F:]
 
     # SwiGLU activation + down projection
-    x_BxLxD = (x_BxLxF * nn.silu(gate_BxLxF)) @ down_kernel
+    x_BxLxD = (x_BxLxF * nn.silu(gate_BxLxF)) @ down_kernel.astype(cd)
     return x_BxLxD
 
 
@@ -1235,11 +1289,14 @@ class TBlock(nn.Module):
                positions: Optional[jax.Array] = None):
     cfg = self.docfg
 
-    # "pre-norm" - Use centralized RMSNorm initialization and epsilon
+    # "pre-norm" - Use centralized RMSNorm initialization and epsilon.
+    # Norm statistics are computed in f32 inside RMSNorm; the output feeds the
+    # attention matmuls so it is emitted in compute_dtype.
     x_BxLxD = RMSNorm(
-      dtype=cfg.dtype, 
-      scale_init=cfg.norm_scale_init, 
-      epsilon=cfg.epsilon
+      dtype=cfg.compute_dtype,
+      scale_init=cfg.norm_scale_init,
+      epsilon=cfg.epsilon,
+      use_scale=cfg.use_norm_scale,
     )(in_BxLxD)
 
     x_BxLxD = CausalAttn(cfg)(
@@ -1251,50 +1308,28 @@ class TBlock(nn.Module):
     # residual connection
     x_BxLxD += in_BxLxD
 
-    # Pre-FFN norm: fused with first projection if enabled
+    # Pre-FFN norm. Dense FFNs take compute_dtype inputs; the MoE block keeps its own
+    # dtype handling (MoeConfig.matmul_dtype) and receives `dtype` inputs as before.
+    # With use_fused_norm the norm is fused into the SwiGLU up/gate projection via
+    # custom_vjp; the call below still creates the scale param (its output is then
+    # unused and dead-code-eliminated by XLA).
     use_fused = getattr(cfg, 'use_fused_norm', False) and cfg.ffn_type == 'swiglu'
-    if use_fused:
-      # Create RMSNorm scale param but don't apply norm yet — pass to MlpSwiGLU for fusion
-      norm_scale = RMSNorm(
-        dtype=cfg.dtype,
-        scale_init=cfg.norm_scale_init,
-        epsilon=cfg.epsilon
-      )
-      # Need to materialize the scale param by calling norm (but we pass pre_norm_input to MlpSwiGLU)
-      z_BxLxD = norm_scale(x_BxLxD)
-    else:
-      z_BxLxD = RMSNorm(
-        dtype=cfg.dtype,
-        scale_init=cfg.norm_scale_init,
-        epsilon=cfg.epsilon
-      )(x_BxLxD)
-
-
-    # Pre-FFN norm: fused with first projection if enabled
-    use_fused = getattr(cfg, 'use_fused_norm', False) and cfg.ffn_type == 'swiglu'
-    if use_fused:
-      # Create RMSNorm scale param but don't apply norm yet — pass to MlpSwiGLU for fusion
-      norm_scale = RMSNorm(
-        dtype=cfg.dtype,
-        scale_init=cfg.norm_scale_init,
-        epsilon=cfg.epsilon
-      )
-      # Need to materialize the scale param by calling norm (but we pass pre_norm_input to MlpSwiGLU)
-      z_BxLxD = norm_scale(x_BxLxD)
-    else:
-      z_BxLxD = RMSNorm(
-        dtype=cfg.dtype,
-        scale_init=cfg.norm_scale_init,
-        epsilon=cfg.epsilon
-      )(x_BxLxD)
-
+    pre_ffn_norm = RMSNorm(
+      dtype=cfg.dtype if cfg.ffn_type == 'moe' else cfg.compute_dtype,
+      scale_init=cfg.norm_scale_init,
+      epsilon=cfg.epsilon,
+      use_scale=cfg.use_norm_scale,
+    )
+    z_BxLxD = pre_ffn_norm(x_BxLxD)
 
     # Choose FFN type based on config
     if cfg.ffn_type == 'swiglu':
       if use_fused:
         # Pass un-normalized input + norm scale for fused RMSNorm+Linear
         z_BxLxD = MlpSwiGLU(cfg)(z_BxLxD, pre_norm_input=x_BxLxD,
-                                  norm_scale=norm_scale.variables['params']['scale'])
+                                  norm_scale=(pre_ffn_norm.variables['params']['scale']
+                                              if cfg.use_norm_scale
+                                              else jnp.ones((x_BxLxD.shape[-1],), cfg.dtype)))
       else:
         z_BxLxD = MlpSwiGLU(cfg)(z_BxLxD)
       loss = 0.0
@@ -1357,7 +1392,8 @@ class CausalAttn(nn.Module):
         k_kernel.reshape(D, cfg.H * Dh),
         v_kernel.reshape(D, cfg.H * Dh),
     ], axis=-1)  # [D, 3*H*Dh]
-    qkv = x_BxLxD @ qkv_kernel  # [B, L, 3*H*Dh]
+    cd = cfg.compute_dtype
+    qkv = x_BxLxD.astype(cd) @ qkv_kernel.astype(cd)  # [B, L, 3*H*Dh]
     q_flat, k_flat, v_flat = jnp.split(qkv, 3, axis=-1)
     q_BxLxHxDh = q_flat.reshape(*x_BxLxD.shape[:-1], cfg.H, Dh)
     k_BxLxHxDh = k_flat.reshape(*x_BxLxD.shape[:-1], cfg.H, Dh)
@@ -1367,11 +1403,13 @@ class CausalAttn(nn.Module):
     if cfg.use_qk_norm:
       # Use RMSNorm with separate instances for k and q - Use centralized norm initialization and epsilon
       k_rms_norm = RMSNorm(epsilon=cfg.epsilon,
-                           dtype=cfg.dtype,
-                           scale_init=cfg.norm_scale_init)
+                           dtype=cd,
+                           scale_init=cfg.norm_scale_init,
+                           use_scale=cfg.use_norm_scale)
       q_rms_norm = RMSNorm(epsilon=cfg.epsilon,
-                           dtype=cfg.dtype,
-                           scale_init=cfg.norm_scale_init)
+                           dtype=cd,
+                           scale_init=cfg.norm_scale_init,
+                           use_scale=cfg.use_norm_scale)
 
       # Apply separate RMSNorm instances along the last dimension
       k_BxLxHxDh = k_rms_norm(k_BxLxHxDh)
@@ -1438,7 +1476,7 @@ class CausalAttn(nn.Module):
           mask=flash_mask,
           scale=scale,
           is_causal=True,
-      ).astype(cfg.dtype)
+      ).astype(cd)
     else:
       out_BxLxHxDh = jax.nn.dot_product_attention(
           q_bf16, k_bf16, v_bf16,
@@ -1446,10 +1484,10 @@ class CausalAttn(nn.Module):
           scale=scale,
           is_causal=True,
           implementation=attn_impl,
-      ).astype(cfg.dtype)
+      ).astype(cd)
     # Output projection: contract (H, Dh) -> D using raw matmul
     out_kernel = KernelParam(shape=(cfg.H, Dh, cfg.D), kernel_init=cfg.hidden_kernel_layer_init, dtype=cfg.dtype, name='attn_out_proj')()
-    out_BxLxD = jnp.einsum('...hk,hkd->...d', out_BxLxHxDh, out_kernel)
+    out_BxLxD = jnp.einsum('...hk,hkd->...d', out_BxLxHxDh, out_kernel.astype(cd))
     return out_BxLxD * cfg.multipliers['output_mult']
 
 
@@ -1579,9 +1617,11 @@ class MuTransformerMoETask(base.Task, MuTask):
         V=cfg.get('vocab_size'),
         F=cfg.get('ffn_dim'),
         use_qk_norm=cfg.get('use_qk_norm', True),
+        use_norm_scale=cfg.get('use_norm_scale', True),
         ffn_type=cfg.get('ffn_type', 'moe'),
         moe_config=moe_config,
         dtype=jnp.float32,
+        compute_dtype=_COMPUTE_DTYPES[cfg.get('compute_dtype')],
         fsdp_enabled=False,
         remat=cfg.get('remat', False),
         use_mup=cfg.get('use_mup', True),
@@ -1677,9 +1717,7 @@ class MuTransformerMoETask(base.Task, MuTask):
     """Compute cross entropy loss for next token prediction."""
     targets = data["label"]
     mask = (data["image"] !=  self.eos_token_id)
-    loss = base.softmax_cross_entropy(
-        logits=logits, labels=jax.nn.one_hot(targets, self.transformer_config.V))
-    return jnp.sum(loss * mask) / jnp.sum(mask)
+    return masked_next_token_loss(logits, targets, mask)
 
   def compute_zloss(self, logits, data):
     """Z-loss regularization on output logits (arXiv 2309.14322).

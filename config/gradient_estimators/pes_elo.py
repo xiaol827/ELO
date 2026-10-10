@@ -18,5 +18,8 @@ gradient_estimator_args = dict(
         expert_magloss_weight=0.3,
         expert_dirloss_wmin=0.0,
         expert_magloss_wmin=0.0,
+        # "decoupled" (default) or "mse"; both IMT losses are always logged,
+        # this only picks which one the meta-gradient follows.
+        imt_loss_type="decoupled",
     )
 )

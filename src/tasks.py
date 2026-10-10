@@ -647,30 +647,18 @@ def preload_tfds_image_classification_datasets_2(
                     
                 for bi in range(0, batches):
                     idxs = idx[bi * batch_size[split]:(bi + 1) * batch_size[split]]
+                    # batch_shape only applies to train splits; eval splits
+                    # always yield flat (batch_size,) batches
                     if not use_localsgd_batches:
-                        # print(jax.process_count())
                         def index_into(idxs, x):
                             device = jax.devices('gpu')[jax.process_index()]
-                            # return x[idxs]
-                            #TODO fix hacky label check
-                            if len(batch_shape) > 1:
-                                return jnp.reshape(jax.device_put(x[idxs], device),
-                                                batch_shape + x.shape[1:] )
-                            else:
-                                return jnp.reshape(jax.device_put(x[idxs],  device),
-                                                (batch_size[split],) + x.shape[1:] )
+                            return jnp.reshape(jax.device_put(x[idxs], device),
+                                            (batch_size[split],) + x.shape[1:] )
                     else:
-                        # print(jax.process_count())
-                        # exit(0)
                         def index_into(idxs, x):
-                            # return x[idxs]
                             #TODO fix hacky label check
-                            if len(batch_shape) > 1:
-                                return jnp.reshape(jax.device_put(x[idxs], image_sharding if len(x.shape) > 1 else label_sharding),
-                                                batch_shape + x.shape[1:] )
-                            else:
-                                return jnp.reshape(jax.device_put(x[idxs], image_sharding if len(x.shape) > 1 else label_sharding),
-                                                (batch_size[split],) + x.shape[1:] )
+                            return jnp.reshape(jax.device_put(x[idxs], image_sharding if len(x.shape) > 1 else label_sharding),
+                                            (batch_size[split],) + x.shape[1:] )
 
 
                     batch = jax.tree_util.tree_map(
@@ -1323,9 +1311,9 @@ def add_transformer_lm_tasks_with_head(tasks, lm_datasets, widths, depths, mup_m
                                                      mup_multipliers=mup_muls))
 
 def add_transformer_lm_moe_tasks_with_head(tasks, lm_datasets, widths, depths, num_experts, active_experts, mup_muls,
-                                           parameterization_args=None, training_config=None):
+                                           parameterization_args=None, training_config=None, compute_dtype=None):
     """Add transformer MoE tasks with configurable head counts and CompletedP support.
-    
+
     Args:
       tasks: Dictionary to add tasks to
       lm_datasets: Dictionary of datasets keyed by name
@@ -1334,6 +1322,8 @@ def add_transformer_lm_moe_tasks_with_head(tasks, lm_datasets, widths, depths, n
       num_experts: List of number of experts
       active_experts: List of active experts per token
       mup_muls: muP multipliers dict
+      compute_dtype: 'bfloat16' for mixed-precision matmuls in the dense transformer
+        layers (params stay float32); None keeps full float32
       parameterization_args: Optional CompletedP parameterization config containing:
         - base_width: Base model width for HP transfer
         - base_depth: Base model depth for HP transfer
@@ -1368,6 +1358,7 @@ def add_transformer_lm_moe_tasks_with_head(tasks, lm_datasets, widths, depths, n
                         'tie_weights': False,
                         'pad_token_id': 2,
                         'use_mup': True,
+                        'compute_dtype': compute_dtype,
                     }
 
                   
@@ -1444,6 +1435,19 @@ def add_transformer_lm_moe_tasks_with_head(tasks, lm_datasets, widths, depths, n
                                               MuTransformerMoETask,
                                               ds,
                                               dict(cfg=copy.deepcopy(cfg),
+                                                  name=name,
+                                                  mup_multipliers=mup_muls,
+                                                  parameterization_args=parameterization_args,
+                                                  training_config=training_config))
+              # Same model without any learnable RMSNorm gain (block, qk and output
+              # norms), matching the celo2 LM-30M / GPT-3 XL reference models.
+              cfg_ns = copy.deepcopy(cfg)
+              cfg_ns['use_norm_scale'] = False
+              name = 'transformer-dense-noscale-w{}-d{}-h{}_{}'.format(w,d,heads,dname)
+              tasks[name] = functools.partial(func_create_func,
+                                              MuTransformerMoETask,
+                                              ds,
+                                              dict(cfg=cfg_ns,
                                                   name=name,
                                                   mup_multipliers=mup_muls,
                                                   parameterization_args=parameterization_args,
@@ -1830,8 +1834,9 @@ from learned_optimization.tasks.datasets import base
 def mnist_datasets(batch_size: int,
                    image_size: Tuple[int, int] = (28, 28),
                    stack_channels: int = 1,
+                   train_perc: int = 80,
                            **kwargs) -> base.Datasets:
-  splits = ("train[0:80%]", "train[80%:90%]", "train[90%:]", "test")
+  splits = (f"train[0:{train_perc}%]", "train[80%:90%]", "train[90%:]", "test")
   return preload_tfds_image_classification_datasets_2(
       "mnist",
       splits,
@@ -1846,8 +1851,9 @@ def fashion_mnist_datasets(batch_size: int,
                            image_size: Tuple[int, int] = (28, 28),
                            stack_channels: int = 1,
                            prefetch_batches: int = 300,
+                           train_perc: int = 80,
                            **kwargs) -> base.Datasets:
-  splits = ("train[0:80%]", "train[80%:90%]", "train[90%:]", "test")
+  splits = (f"train[0:{train_perc}%]", "train[80%:90%]", "train[90%:]", "test")
   return preload_tfds_image_classification_datasets_2(
       "fashion_mnist",
       splits,
@@ -1862,17 +1868,36 @@ def fashion_mnist_datasets(batch_size: int,
 def cifar10_datasets(batch_size: int,
                      image_size: Tuple[int, int] = (32, 32),
                      data_fraction: float = 1.,
+                     train_perc: int = 100,
                     **kwargs) -> base.Datasets:
-  perc = max(1, int(80 * data_fraction))
-  perc=100
+  perc = max(1, int(train_perc * data_fraction))
   splits = (f"train[0:{perc}%]", "train[80%:90%]", "train[90%:]", "test")
   return preload_tfds_image_classification_datasets_2(
 
-      "cifar10", splits, 
-      batch_size=batch_size, 
-      image_size=image_size, 
+      "cifar10", splits,
+      batch_size=batch_size,
+      image_size=image_size,
       normalize_mean=(0.4914 * 255, 0.4822 * 255, 0.4465 * 255),
       normalize_std=(0.2470 * 255, 0.2435 * 255, 0.2616* 255),
+      **kwargs)
+
+
+@base.dataset_lru_cache
+@gin.configurable
+def cifar10_datasets_unnormalized(batch_size: int,
+                                  image_size: Tuple[int, int] = (32, 32),
+                                  data_fraction: float = 1.,
+                                  train_perc: int = 80,
+                                  **kwargs) -> base.Datasets:
+  """Matches google learned_optimization image.cifar10_datasets used by the
+  official celo meta-training tasks: images scaled by /255 (no mean/std
+  standardization). train_perc controls the train split size."""
+  perc = max(1, int(train_perc * data_fraction))
+  splits = (f"train[0:{perc}%]", "train[80%:90%]", "train[90%:]", "test")
+  return preload_tfds_image_classification_datasets_2(
+      "cifar10", splits,
+      batch_size=batch_size,
+      image_size=image_size,
       **kwargs)
 
 
@@ -1894,8 +1919,12 @@ def cifar100_datasets(
 def svhn_cropped_datasets(batch_size: int,
                           image_size: Tuple[int, int] = (32, 32),
                           data_fraction: float = 1.,
+                          train_perc: int = 80,
                           **kwargs) -> base.Datasets:
-  perc = min(1, int(80 * data_fraction))
+  # upstream google learned_optimization has min(1, ...) here — a bug that
+  # pins the train split to train[0:1%] (733 images); official celo2
+  # inherited it. Fixed to the cifar10 pattern; train_perc controls the size.
+  perc = max(1, int(train_perc * data_fraction))
   splits = (f"train[0:{perc}%]", "train[80%:90%]", "train[90%:]", "test")
   return preload_tfds_image_classification_datasets_2(
       "svhn_cropped",
@@ -2012,6 +2041,9 @@ def get_task(args, is_test=False):
                                 image_sharding=temp_bsz_args["image_sharding"],
                                 image_dtype=image_dtype,)
 
+        # celo2 meta-train datasets: full train pool during meta-training
+        # (no validation needed), train[0:80%] at meta-test time
+        celo_train_perc = 80 if args.run_type in ['benchmark', 'sweep'] else 100
 
         IMAGE_DATASET_REGISTY = {
 
@@ -2040,18 +2072,45 @@ def get_task(args, is_test=False):
 
             'random-224x224x3':  dict(fun=random_datasets,args=[],kwargs=dict(batch_size=batch_size,image_size=(224, 224), **ds_kwargs)),
 
-            'cifar10-32x32x3': dict(fun=cifar10_datasets,args=[],kwargs=dict(batch_size=batch_size, image_size=(32, 32), **ds_kwargs)),
             'food101-32x32x3': dict(fun=food101_datasets,args=[],kwargs=dict(batch_size=batch_size, image_size=(32, 32), **ds_kwargs)),
-            'fashionmnist-28x28x1': dict(fun=fashion_mnist_datasets,args=[],kwargs=dict(batch_size=batch_size, **ds_kwargs)),
-            'fashionmnist-8x8x1': dict(fun=fashion_mnist_datasets,args=[],kwargs=dict(batch_size=batch_size, image_size=(8, 8), **ds_kwargs)),
+          
 
 
             # CELO2 meta-training tasks (8x8 resolution)
-            'mnist-28x28x1': dict(fun=mnist_datasets,args=[],kwargs=dict(batch_size=batch_size, **ds_kwargs)),
-            'mnist-8x8x1': dict(fun=mnist_datasets,args=[],kwargs=dict(batch_size=batch_size, image_size=(8, 8), **ds_kwargs)),
+            # cifar10_datasets_unnormalized
+
+            'fashionmnist-28x28x1': dict(fun=fashion_mnist_datasets,args=[],kwargs=dict(batch_size=batch_size, train_perc=celo_train_perc, **ds_kwargs)),
+            'fashionmnist-8x8x1': dict(fun=fashion_mnist_datasets,args=[],kwargs=dict(batch_size=batch_size, train_perc=celo_train_perc, image_size=(8, 8), **ds_kwargs)),
+            'mnist-28x28x1': dict(fun=mnist_datasets,args=[],kwargs=dict(batch_size=batch_size, train_perc=celo_train_perc, **ds_kwargs)),
+            'mnist-8x8x1': dict(fun=mnist_datasets,args=[],kwargs=dict(batch_size=batch_size, train_perc=celo_train_perc, image_size=(8, 8), **ds_kwargs)),
+            'cifar10-32x32x3': dict(fun=cifar10_datasets,args=[],kwargs=dict(batch_size=batch_size, image_size=(32, 32), **ds_kwargs)),
+            'cifar10-32x32x1': dict(fun=cifar10_datasets,args=[],kwargs=dict(batch_size=batch_size, train_perc=celo_train_perc, image_size=(32, 32), convert_to_black_and_white=True, **ds_kwargs)),
             'cifar10-8x8x3': dict(fun=cifar10_datasets,args=[],kwargs=dict(batch_size=batch_size, image_size=(8, 8), **ds_kwargs)),
-            'svhn-32x32x3': dict(fun=svhn_cropped_datasets,args=[],kwargs=dict(batch_size=batch_size, image_size=(32, 32), **ds_kwargs)),
-            'svhn-8x8x3': dict(fun=svhn_cropped_datasets,args=[],kwargs=dict(batch_size=batch_size, image_size=(8, 8), **ds_kwargs)),
+            'cifar10-8x8x1': dict(fun=cifar10_datasets,args=[],kwargs=dict(batch_size=batch_size, train_perc=celo_train_perc, image_size=(8, 8), convert_to_black_and_white=True, **ds_kwargs)),
+            'svhn-32x32x3': dict(fun=svhn_cropped_datasets,args=[],kwargs=dict(batch_size=batch_size, train_perc=celo_train_perc, image_size=(32, 32), **ds_kwargs)),
+            'svhn-32x32x1': dict(fun=svhn_cropped_datasets,args=[],kwargs=dict(batch_size=batch_size, train_perc=celo_train_perc, image_size=(32, 32), convert_to_black_and_white=True, **ds_kwargs)),
+            'svhn-8x8x3': dict(fun=svhn_cropped_datasets,args=[],kwargs=dict(batch_size=batch_size, train_perc=celo_train_perc, image_size=(8, 8), **ds_kwargs)),
+            'svhn-8x8x1': dict(fun=svhn_cropped_datasets,args=[],kwargs=dict(batch_size=batch_size, train_perc=celo_train_perc, image_size=(8, 8), convert_to_black_and_white=True, **ds_kwargs)),
+
+            # 4x4 resolution variants
+            'fashionmnist-4x4x1': dict(fun=fashion_mnist_datasets,args=[],kwargs=dict(batch_size=batch_size, train_perc=celo_train_perc, image_size=(4, 4), **ds_kwargs)),
+            'mnist-4x4x1': dict(fun=mnist_datasets,args=[],kwargs=dict(batch_size=batch_size, train_perc=celo_train_perc, image_size=(4, 4), **ds_kwargs)),
+            'cifar10-4x4x3': dict(fun=cifar10_datasets,args=[],kwargs=dict(batch_size=batch_size, image_size=(4, 4), **ds_kwargs)),
+            'cifar10-4x4x1': dict(fun=cifar10_datasets,args=[],kwargs=dict(batch_size=batch_size, train_perc=celo_train_perc, image_size=(4, 4), convert_to_black_and_white=True, **ds_kwargs)),
+            'svhn-4x4x3': dict(fun=svhn_cropped_datasets,args=[],kwargs=dict(batch_size=batch_size, train_perc=celo_train_perc, image_size=(4, 4), **ds_kwargs)),
+            'svhn-4x4x1': dict(fun=svhn_cropped_datasets,args=[],kwargs=dict(batch_size=batch_size, train_perc=celo_train_perc, image_size=(4, 4), convert_to_black_and_white=True, **ds_kwargs)),
+
+            # 16x16 resolution variants
+            'fashionmnist-16x16x1': dict(fun=fashion_mnist_datasets,args=[],kwargs=dict(batch_size=batch_size, train_perc=celo_train_perc, image_size=(16, 16), **ds_kwargs)),
+            'mnist-16x16x1': dict(fun=mnist_datasets,args=[],kwargs=dict(batch_size=batch_size, train_perc=celo_train_perc, image_size=(16, 16), **ds_kwargs)),
+
+            # 32x32 upscaled variants (mnist/fmnist native 28x28 -> 32x32)
+            'fashionmnist-32x32x1': dict(fun=fashion_mnist_datasets,args=[],kwargs=dict(batch_size=batch_size, train_perc=celo_train_perc, image_size=(32, 32), **ds_kwargs)),
+            'mnist-32x32x1': dict(fun=mnist_datasets,args=[],kwargs=dict(batch_size=batch_size, train_perc=celo_train_perc, image_size=(32, 32), **ds_kwargs)),
+            'cifar10-16x16x3': dict(fun=cifar10_datasets,args=[],kwargs=dict(batch_size=batch_size, image_size=(16, 16), **ds_kwargs)),
+            'cifar10-16x16x1': dict(fun=cifar10_datasets,args=[],kwargs=dict(batch_size=batch_size, train_perc=celo_train_perc, image_size=(16, 16), convert_to_black_and_white=True, **ds_kwargs)),
+            'svhn-16x16x3': dict(fun=svhn_cropped_datasets,args=[],kwargs=dict(batch_size=batch_size, train_perc=celo_train_perc, image_size=(16, 16), **ds_kwargs)),
+            'svhn-16x16x1': dict(fun=svhn_cropped_datasets,args=[],kwargs=dict(batch_size=batch_size, train_perc=celo_train_perc, image_size=(16, 16), convert_to_black_and_white=True, **ds_kwargs)),
 
 
             # aug versions
@@ -2233,7 +2292,7 @@ def get_task(args, is_test=False):
                               (128,1),(128,2),(128,4),(128,6),(128,8),(128,16),
                               (192,1),(192,2),(192,3),(192,4),(192,6),(192,8),(192,12),(192,16),
                               (256,1),(256,2),(256,4),(256,8),(256,16),
-                              (384,1),(384,2),(384,4),(384,6),(384,8),(384,12),(384,16),
+                              (384,1),(384,2),(384,3),(384,4),(384,6),(384,8),(384,12),(384,16),
                               (512,1),(512,2),(512,4),(512,6),(512,8),(512,12),(512,16),
                               (768,1),(768,2),(768,4),(768,6),(768,8),(768,12),(768,16),
                               (1024,1),(1024,2),(1024,4),(1024,8),(1024,16),(1024,32),
@@ -2247,7 +2306,8 @@ def get_task(args, is_test=False):
                                                 active_experts=[x for x in range(1,11)], 
                                                 mup_muls=mup_multipliers,
                                                 parameterization_args=completedp_parameterization_args,
-                                                training_config=completedp_training_config)
+                                                training_config=completedp_training_config,
+                                                compute_dtype='bfloat16' if args.use_bf16 else None)
         #this is kept for backwards compatibility
         add_vision_transformer_tasks(tasks,
                                      image_datasets=IMAGE_DATASET_REGISTY,

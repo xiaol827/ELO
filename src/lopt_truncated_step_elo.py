@@ -52,6 +52,10 @@ class TruncatedUnrollOut:
   mask: jnp.ndarray
   imt_cosine_loss: jnp.ndarray
   imt_magnitude_loss: jnp.ndarray
+  # Plain MSE between the expert and LO updates. Always populated alongside the
+  # decoupled (cosine, magnitude) pair so both objectives can be logged in the
+  # same run; the estimator's imt_loss_type picks which one drives the gradient.
+  imt_mse_loss: jnp.ndarray = None
   # Per-step buffer warm-restart signal: the slot index restored at this step
   # when reset_fn took the buffer branch, else -1 (train step or random init).
   # Consumed by the PES estimator to restore the perturbation accumulator (ELO
@@ -104,7 +108,7 @@ class SimpleLOptTruncatedStep(truncated_step.TruncatedStep):
           task_param=None,
           iteration=unroll_state.iteration,
           mask=True,
-          imt_cosine_loss=0., imt_magnitude_loss=0.,
+          imt_cosine_loss=0., imt_magnitude_loss=0., imt_mse_loss=0.,
       )
       return unroll_state, out
 
@@ -117,7 +121,7 @@ class SimpleLOptTruncatedStep(truncated_step.TruncatedStep):
           task_param=None,
           iteration=unroll_state.iteration,
           mask=False,
-          imt_cosine_loss=0., imt_magnitude_loss=0.,
+          imt_cosine_loss=0., imt_magnitude_loss=0., imt_mse_loss=0.,
       )
       return unroll_state, out
 
@@ -282,15 +286,16 @@ def progress_or_reset_inner_opt_state(
     cond_fn: Callable[[bool, Any, Any, Any], Any] = jax.lax.cond,
     axis_name: Optional[str] = None,
     meta_loss_with_aux_key: Optional[str] = None,
-) -> Tuple[T, G, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, Any, Any, jnp.ndarray, Any, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+) -> Tuple[T, G, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, Any, Any, jnp.ndarray, Any, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
   """Train a single step, or reset the current inner problem.
 
   On reset, with probability `1 - buffer_random_init_prob` we warm-restart from
   a uniformly chosen slot in `state_buffer` (paired with the task_param that was
   active when that slot was pushed); otherwise we sample a fresh task and a
-  fresh opt_state. During training, each step updates per-task CUSUM statistics
-  (`last_step_loss`, `last_cumulative_sum`, `max_cumulative_sum`) that drive the
-  outer-layer push-to-buffer decision in the PES estimator.
+  fresh opt_state. During training, each step accumulates per-task loss
+  improvement (`last_step_loss`, `last_cumulative_sum`, `max_cumulative_sum`);
+  a rise of max_cumulative_sum marks a new loss low and drives the outer-layer
+  push-to-buffer decision in the PES estimator.
   """
   # summary.summary("num_steps", num_steps, aggregation="sample")
 
@@ -327,6 +332,20 @@ def progress_or_reset_inner_opt_state(
         jax.lax.cond(use_random, random_branch, buffer_branch,
                      jax.random.fold_in(key_rand, 0)))
 
+    # Carry the expert_weight across the reset. The PES estimator writes the
+    # scheduled value into inner_opt_state once per OUTER step, and the lopt
+    # update preserves it, but a reset would otherwise drop it: random_branch
+    # goes through opt.init (hard-coded 1.0) and buffer_branch restores
+    # whatever value was live when that slot was pushed. Either way the task
+    # would run the rest of the truncation window (up to trunc_length inner
+    # steps) on a stale expert_weight -- pure expert after the schedule had
+    # already decayed it to 0 -- corrupting both the trajectory and its IMT
+    # losses. The incoming inner_opt_state always holds the correct value for
+    # the current outer step, so reuse it and stay schedule-agnostic here.
+    next_inner_opt_state = next_inner_opt_state.replace(
+        expert_weight=jnp.asarray(inner_opt_state.expert_weight,
+                                  dtype=next_inner_opt_state.expert_weight.dtype))
+
     fresh_length = truncation_state.length
     extended_length = next_inner_step + fresh_length
     effective_length = jnp.where(use_random, fresh_length, extended_length)
@@ -338,7 +357,7 @@ def progress_or_reset_inner_opt_state(
     reset_last_cumsum = jnp.asarray(0.0, dtype=jnp.float32)
     reset_max_cumsum = jnp.asarray(0.0, dtype=jnp.float32)
     return (next_inner_opt_state, new_task_param, next_inner_step,
-            zero, zero, zero,
+            zero, zero, zero, zero,
             state_buffer, task_param_buffer, next_write_slot,
             next_truncation_state,
             reset_last_loss, reset_last_cumsum, reset_max_cumsum,
@@ -372,18 +391,20 @@ def progress_or_reset_inner_opt_state(
 
     # summary.summary("task_loss", l)
 
-    next_inner_opt_state, cosine_loss, magnitude_loss = opt.update(
+    next_inner_opt_state, cosine_loss, magnitude_loss, mse_loss = opt.update(
         inner_opt_state, g, loss=l, model_state=s, key=key2)
     next_inner_step = inner_step + 1
 
-    # CUSUM update: accumulate evidence that the LO is struggling.
-    # increment = -delta_loss - delta (threshold hard-coded to 0.0).
+    # CUSUM update: accumulate positive loss improvement (no clamp), so
+    # V_n = l_first - l_n within a trajectory and max V is reached exactly at
+    # the loss minimum. First step after reset (last_step_loss sentinel 1e8)
+    # contributes 0 to avoid poisoning V with the sentinel delta.
     l_f32 = jnp.asarray(l, dtype=jnp.float32)
     delta_loss = last_step_loss - l_f32
-    increment = -delta_loss
-    new_last_cumsum = jnp.maximum(
-        jnp.asarray(0.0, dtype=jnp.float32),
-        last_cumulative_sum + increment)
+    is_first_step = last_step_loss >= jnp.asarray(1e7, dtype=jnp.float32)
+    increment = jnp.where(is_first_step, jnp.asarray(0.0, dtype=jnp.float32),
+                          delta_loss)
+    new_last_cumsum = last_cumulative_sum + increment
     new_max_cumsum = jnp.maximum(max_cumulative_sum, new_last_cumsum)
     new_last_step_loss = l_f32
 
@@ -391,6 +412,7 @@ def progress_or_reset_inner_opt_state(
             jnp.asarray(meta_loss, dtype=jnp.float32),
             jnp.asarray(cosine_loss, dtype=jnp.float32),
             jnp.asarray(magnitude_loss, dtype=jnp.float32),
+            jnp.asarray(mse_loss, dtype=jnp.float32),
             state_buffer, task_param_buffer, next_write_slot,
             truncation_state,
             new_last_step_loss, new_last_cumsum, new_max_cumsum,
@@ -435,7 +457,8 @@ def _truncated_unroll_one_step(
     num_steps = state.truncation_state.length
 
   (next_inner_opt_state, task_param, next_inner_step, task_loss,
-   cosine_loss, magnitude_loss, new_state_buffer, new_task_param_buffer,
+   cosine_loss, magnitude_loss, mse_loss,
+   new_state_buffer, new_task_param_buffer,
    new_next_write_slot, next_truncation_state,
    new_last_step_loss, new_last_cumulative_sum, new_max_cumulative_sum,
    reset_slot) = (
@@ -491,6 +514,7 @@ def _truncated_unroll_one_step(
       task_param=state.task_param,
       imt_cosine_loss=cosine_loss,
       imt_magnitude_loss=magnitude_loss,
+      imt_mse_loss=mse_loss,
       reset_slot=reset_slot,
   )
 

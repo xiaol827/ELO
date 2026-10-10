@@ -13,7 +13,7 @@ learned_optimizer_args = dict(
       hidden_size=32,
       hidden_layers=2,
       initial_momentum_decays=(0.9, 0.99, 0.999),
-      initial_rms_decays=(0.999,),
+      initial_rms_decays=(0.95,),
       initial_adafactor_decays=(0.9, 0.99, 0.999),
       concat_weights=True,
       make_separate_weights=False,
@@ -25,4 +25,9 @@ learned_optimizer_args = dict(
       step_mult_min=1e-4,
       expert_optim="adamw",
       muon_expert_adamlr_scaler=0.3,
+      # Expert accumulator channel indices (which decay channel each expert reads)
+      exp_sgdm_mom_idx=0,
+      exp_adam_mom_idx=0,
+      exp_muon_mom_idx=1,
+      exp_adam_rms_idx=-1,
       ))

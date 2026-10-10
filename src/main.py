@@ -11,8 +11,12 @@ os.environ['XLA_FLAGS'] = (
     '--xla_gpu_enable_latency_hiding_scheduler=true '
     '--xla_gpu_enable_triton_gemm=true '
     '--xla_gpu_enable_pipelined_all_reduce=true '
-    '--xla_gpu_autotune_level=0 '  # disable autotuner to avoid DEVICE_TYPE_INVALID crash in AutotunerPass on multi-process collectives
-
+    # Multi-process "sharded autotuning" (processes split the tuning work and
+    # exchange results) is what produced DEVICE_TYPE_INVALID in AutotunerPass.
+    # Turning the autotuner off entirely (autotune_level=0) hid that for fp32
+    # but breaks bf16: Triton GEMM fusions need a tuned config and CHECK-fail
+    # without one. Keep autotuning on (default level), just not sharded.
+    '--xla_gpu_shard_autotuning=false '
 )
 import os.path as osp
 import pprint
@@ -116,6 +120,10 @@ def parse_args():
     parser.add_argument("--truncation_length", type=int)
     parser.add_argument("--finetune", action="store_true")
     parser.add_argument("--log_activations", action="store_true")
+    # benchmark: log l2 norms of grads / params / param updates each step (computed
+    # inside the jitted step). Off by default: it is the only reason to keep the
+    # previous params around and it forces extra host syncs.
+    parser.add_argument("--log_param_norms", action="store_true")
     parser.add_argument("--mup_to_lstm", action="store_true")
     parser.add_argument("--zero_lstm_features", action="store_true")
     parser.add_argument("--zero_training_step_feature", action="store_true")
@@ -251,7 +259,12 @@ if __name__ == "__main__":
             num_processes=size,
             process_id=rank,
             local_device_ids=[local_rank],
-
+            # Defaults (init=300s, heartbeat=100s) are too tight for long multi-process
+            # runs on SLURM clusters: a transient shared-FS/network stall makes one task miss
+            # heartbeats and the coordination service kills the whole job. Widen the
+            # timeouts so the run survives minute-scale hiccups.
+            initialization_timeout=600,
+            heartbeat_timeout_seconds=600,
         )
 
 
@@ -262,12 +275,15 @@ if __name__ == "__main__":
 
         # Commenting out sync - causes NCCL errors with single-node multi-process setup
         multihost_utils.sync_global_devices('sync')
-        
-        # CRITICAL: Set TensorFlow env vars BEFORE importing TensorFlow
-        os.environ["TF_FORCE_GPU_ALLOW_GROWTH"] = "true"
-        os.environ["TF_GPU_THREAD_MODE"] = "gpu_private"
-        import tensorflow as tf
-        tf.config.experimental.set_visible_devices([], "GPU")
+
+    # CRITICAL: Set TensorFlow env vars BEFORE importing TensorFlow.
+    # Must run in the single-process path too: the tfds input pipeline
+    # otherwise creates a TF GPU device that preallocates the whole card
+    # and JAX later fails with "Failed to initialize BLAS support".
+    os.environ["TF_FORCE_GPU_ALLOW_GROWTH"] = "true"
+    os.environ["TF_GPU_THREAD_MODE"] = "gpu_private"
+    import tensorflow as tf
+    tf.config.experimental.set_visible_devices([], "GPU")
 
     # Import local modules AFTER JAX and TensorFlow initialization
     print_rank_0("Importing local modules...")
@@ -335,14 +351,18 @@ if __name__ == "__main__":
         cfg.name = "{}{}_{}{}".format(
             cfg.optimizer, cfg.hidden_size, cfg.task, cfg.name_suffix
         )
-    cfg.meta_train_name = "{}{}_{}_K{}_H{}_{}_{}_{}".format(
+    # cfg.meta_train_name = "{}{}_{}_K{}_H{}_{}_{}_{}".format(
+    #     cfg.optimizer,
+    #     cfg.hidden_size,
+    #     cfg.task[0] if len(cfg.task) == 1 else "multi-task-with"+cfg.task[0],
+    #     cfg.num_grads,
+    #     cfg.num_local_steps,
+    #     cfg.local_optimizer,
+    #     cfg.local_learning_rate,
+    #     cfg.name_suffix,
+    # )
+    cfg.meta_train_name = "{}_{}".format(
         cfg.optimizer,
-        cfg.hidden_size,
-        cfg.task[0] if len(cfg.task) == 1 else "multi-task-with"+cfg.task[0],
-        cfg.num_grads,
-        cfg.num_local_steps,
-        cfg.local_optimizer,
-        cfg.local_learning_rate,
         cfg.name_suffix,
     )
     if args.num_devices is not None:
@@ -410,8 +430,13 @@ if __name__ == "__main__":
     #########################################################
     # Set precision
     #########################################################
-    if args.use_bf16 and test_bf16_support_on_gpu():
-        print_rank_0('setting bf 16 as default supported')
+    # --use_bf16 = mixed precision: fp32 master params / residual stream, bf16 matmul
+    # operands inside the transformer (see DoConfig.compute_dtype, wired in tasks.get_task).
+    # jax_default_matmul_precision only affects fp32-operand matmuls and is kept as before.
+    if args.use_bf16:
+        if not test_bf16_support_on_gpu():
+            raise RuntimeError("--use_bf16 requested but bf16 is not supported on this backend")
+        print_rank_0('bf16 mixed precision enabled (compute_dtype=bfloat16)')
         jax.config.update('jax_default_matmul_precision', 'bfloat16')
     else:
         jax.config.update("jax_default_matmul_precision", "high")

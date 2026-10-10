@@ -261,6 +261,9 @@ def _fedlagg(args, mup_update_dict, task=None):
 
         return out, final_local_opt_state, loss, avg_delta
 
+    # this path keeps opt_state local; same interface as _default_lopt's update
+    update.to_global = update.to_local = lambda x: x
+
     return outer_opt, update
 
 
@@ -341,14 +344,39 @@ def _default_lopt(args, mup_update_dict, task=None):
     if task is None:
         task = get_task(args)[0]
 
-    @functools.partial(jax.jit, donate_argnums=(0,))  # donate opt_state buffer
-    def opt_update(opt_state, grad, loss, model_state, key):
-        return opt.update(opt_state=opt_state, grad=grad, loss=loss, model_state=model_state, key=key)
+    log_norms = getattr(args, 'log_param_norms', False)
 
-    # Implicit GSPMD: shard batch across devices, replicate params/state.
-    # XLA automatically inserts NCCL allreduce for gradients of replicated
-    # params computed from sharded data.  This avoids the XLA AutotunerPass
-    # DEVICE_TYPE_INVALID crash that explicit lax.psum inside shard_map triggers.
+    def _l2(tree):
+        return jnp.sqrt(sum(jnp.sum(jnp.square(x)) for x in jax.tree_util.tree_leaves(tree)))
+
+    # fw + bw (with gradient accumulation) + optimizer update as ONE executable.
+    # Under multi-process the inputs are global arrays (batch sharded over 'dp',
+    # opt_state / key replicated) and XLA inserts the gradient allreduce itself
+    # (implicit GSPMD). This avoids the XLA AutotunerPass DEVICE_TYPE_INVALID
+    # crash that explicit lax.psum inside shard_map triggers.
+    @functools.partial(jax.jit, donate_argnums=(0,))  # donate opt_state buffer
+    def _step(opt_state, key, batch):
+        params = opt.get_params(opt_state)
+        state = opt.get_state(opt_state)
+        key, key1 = jax.random.split(key)
+        (loss, model_state), grad = grad_loss_state_accumulate(
+            task.loss_with_state, params, state, key1, batch)
+        new_opt_state = opt.update(
+            opt_state=opt_state, grad=grad, loss=loss, model_state=model_state, key=key)
+        # ELO_*LOpt.update with meta_train=True returns (state, cosine_loss, magnitude_loss);
+        # benchmark only consumes the state.
+        if isinstance(new_opt_state, tuple):
+            new_opt_state = new_opt_state[0]
+        metrics = {}
+        if log_norms:
+            new_params = opt.get_params(new_opt_state)
+            metrics = {
+                'l2_grads': _l2(grad),
+                'l2_params': _l2(new_params),
+                'l2_updates': _l2(jax.tree_util.tree_map(lambda n, p: n - p, new_params, params)),
+            }
+        return new_opt_state, loss, metrics
+
     if args.world_size > 1:
         _all_devices = jax.devices()
         _mesh = Mesh(np.array(_all_devices), ('dp',))
@@ -369,9 +397,10 @@ def _default_lopt(args, mup_update_dict, task=None):
         def _to_global_replicated(pytree):
             """Wrap local arrays into globally-replicated arrays."""
             def _rep(x):
+                # x may be a python scalar leaf (e.g. opt_state.num_steps)
                 local_arr = jax.device_put(x, jax.local_devices()[0])
                 return jax.make_array_from_single_device_arrays(
-                    x.shape, _replicated, [local_arr])
+                    local_arr.shape, _replicated, [local_arr])
             return jax.tree_util.tree_map(_rep, pytree)
 
         def _to_local(pytree):
@@ -383,55 +412,35 @@ def _default_lopt(args, mup_update_dict, task=None):
                     return x.addressable_data(0)
                 return x
             return jax.tree_util.tree_map(_loc, pytree)
+    else:
+        _to_global_batch = _to_local = lambda x: x
 
-        @jax.jit
-        def _grad_and_allreduce(params, state, key, batch):
-            (loss, model_state), grad = grad_loss_state_accumulate(
-                task.loss_with_state, params, state, key, batch
-            )
-            return loss, model_state, grad
+        def _to_global_replicated(pytree):
+            """Single-process counterpart of the replicated wrap above.
+
+            Normalises python scalar leaves (e.g. opt_state.num_steps) to device
+            arrays exactly like the multi-process path, so the jitted step sees the
+            same leaf types before and after the first update and is compiled once.
+            Each leaf is also copied: _step donates opt_state, and init_with_state
+            puts the task's cached arrays (task.mup_state / mup_eps_mult) straight
+            into it -- the same arrays loss_with_state closes over as constants.
+            Donating them invalidates those constants, and the next compile of the
+            step then fails with "Array has been deleted".
+            """
+            device = jax.local_devices()[0]
+            return jax.tree_util.tree_map(
+                lambda x: jnp.array(jax.device_put(x, device), copy=True), pytree)
 
     def update(opt_state, key, batch):
-        state = opt.get_state(opt_state)
-        params = opt.get_params(opt_state)
-        key, key1 = jax.random.split(key)
+        """opt_state must be global (wrap once with update.to_global after
+        opt.init / checkpoint load); it stays global across steps so only the
+        batch and the key are wrapped per step."""
+        return _step(opt_state, _to_global_replicated(key), _to_global_batch(batch))
 
-        with Timing('fw bw', []):
-            if args.world_size > 1:
-                # Implicit GSPMD: place data on mesh, XLA auto-inserts allreduce
-                g_batch = _to_global_batch(batch)
-                g_params = _to_global_replicated(params)
-                g_state = _to_global_replicated(state)
-                g_key = _to_global_replicated(key1)
-                g_loss, g_ms, g_grad = _grad_and_allreduce(
-                    g_params, g_state, g_key, g_batch)
-                loss = _to_local(g_loss)
-                model_state = _to_local(g_ms)
-                grad = _to_local(g_grad)
-            else:
-                (loss, model_state), grad = grad_loss_state_accumulate(
-                    task.loss_with_state, params=params, state=state, key=key1, batch=batch,
-                )
-
-        with Timing('AR', []):
-            pass  # allreduce is implicit via GSPMD sharding propagation
-
-        with Timing('optimizer step', []):
-            temp = opt_update(
-                opt_state=opt_state,
-                grad=grad,
-                loss=loss,
-                model_state=model_state,
-                key=key
-            )
-
-
-        # ELO_*LOpt.update with meta_train=True returns (state, cosine_loss, magnitude_loss);
-        # benchmark only consumes the state.
-        if isinstance(temp, tuple):
-            temp = temp[0]
-
-        return temp, loss, grad
+    # benchmark.py needs these for the few places that want local arrays
+    # (test eval, checkpoint save) or a fresh global opt_state (init, resume).
+    update.to_global = _to_global_replicated
+    update.to_local = _to_local
 
     return opt, update
 

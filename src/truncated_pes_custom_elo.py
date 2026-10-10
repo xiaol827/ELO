@@ -49,6 +49,23 @@ def second_moment_normalizer(x, eps=1e-8):
   return x * lax.rsqrt(eps+jnp.mean(jnp.square(x), keepdims=True))
 
 
+def masked_second_moment_normalizer(x, mask, eps=1e-8):
+  """RMS-normalize x using only the entries where mask is set.
+
+  The unmasked variant averages over the whole [steps, num_tasks] tensor,
+  including the reset steps that carry a hard 0. Those zeros shrink the mean
+  square, so the resulting scale drifts with the mask density -- which itself
+  moves with the inner-length schedule (a log-uniform length makes it move a
+  lot more than a fixed one). eps must stay > 0: with eps=0 an all-zero tensor
+  (e.g. the very first unroll, where every step is a reset) gives
+  rsqrt(0) = inf and 0 * inf = NaN, which poisons the whole meta-gradient.
+  """
+  m = mask.astype(jnp.float32)
+  denom = jnp.maximum(jnp.sum(m), jnp.float32(1.0))
+  mean_sq = jnp.sum(jnp.square(x) * m) / denom
+  return x * lax.rsqrt(mean_sq + eps)
+
+
 def _meta_grad_snr(vec_es_grad, es_grad):
   """Global vector SNR of the meta-gradient (fp32 accumulation).
 
@@ -98,14 +115,6 @@ def _delta_loss_snr(delta_losses, mask):
   return abs_mean / (std + jnp.float32(1e-12))
 
 
-def _select_per_task(post_tree, pre_tree, done_flag):
-  """Per-task select: done_flag[t] True -> post[t], else pre[t]. Broadcasts flag."""
-  return jax.tree_util.tree_map(
-      lambda po, pr: jnp.where(
-          done_flag.reshape((-1,) + (1,) * (po.ndim - 1)), po, pr),
-      post_tree, pre_tree)
-
-
 def _write_per_task_if(buffer_tree, value_tree, slot_vec, push_flag_vec):
   """Per-task conditional write into buffer[t, slot[t]] (vmap over task axis).
 
@@ -125,53 +134,47 @@ def _push_buffers_core(
     p_state, n_state,
     snap_pos_opt, snap_pos_tp, snap_neg_opt, snap_neg_tp,
     snap_mean_max_cumsum,
-    pos_is_done_stack, neg_is_done_stack,
+    any_done,
     buffer_size,
 ):
-  """Post-truncation push decision + FIFO buffer write (pure jnp/vmap).
+  """Post-truncation push decision + buffer write (pure jnp/vmap).
 
-  struggled  = post mean(pos/neg max_cumulative_sum) > pre snapshot mean.
-  any_done   = OR of is_done across the truncation on either side.
-  push       = struggled | any_done.
-  On any_done: write post-truncation state; else on struggled: write pre snapshot.
-  Uses FIFO next_write_slot from p_state (pos/neg kept in sync).
+  V_n accumulates positive loss improvement (no clamp), so within a trajectory
+  max V is reached exactly at the loss minimum and is monotone non-decreasing.
+  improved = post mean(pos/neg max_cumulative_sum) > pre snapshot mean
+           <=> a new loss low occurred inside this truncation window.
+  On improved: overwrite the CURRENT slot with the pre-window snapshot.
+  The slot only advances when the trajectory ends (any_done), so all pushes of
+  one full unroll target one slot; its final content is the snapshot taken one
+  window before the trajectory's loss minimum, and a buffer of size B holds
+  states from B distinct full unrolls.
   """
   post_mean = 0.5 * (p_state.max_cumulative_sum + n_state.max_cumulative_sum)
-  struggled = post_mean > snap_mean_max_cumsum
-  any_done = jnp.any(pos_is_done_stack, axis=0) | jnp.any(neg_is_done_stack, axis=0)
-  push = struggled | any_done
+  push = post_mean > snap_mean_max_cumsum
 
   slots = p_state.next_write_slot
-  # sel_pos_opt = _select_per_task(p_state.inner_opt_state, snap_pos_opt, any_done)
-  # sel_pos_tp  = _select_per_task(p_state.task_param,      snap_pos_tp,  any_done)
-  # sel_neg_opt = _select_per_task(n_state.inner_opt_state, snap_neg_opt, any_done)
-  # sel_neg_tp  = _select_per_task(n_state.task_param,      snap_neg_tp,  any_done)
-
   new_pos_sb  = _write_per_task_if(p_state.state_buffer,      snap_pos_opt, slots, push)
   new_pos_tpb = _write_per_task_if(p_state.task_param_buffer, snap_pos_tp,  slots, push)
   new_neg_sb  = _write_per_task_if(n_state.state_buffer,      snap_neg_opt, slots, push)
   new_neg_tpb = _write_per_task_if(n_state.task_param_buffer, snap_neg_tp,  slots, push)
 
-  new_slots = jnp.where(push, (slots + 1) % buffer_size, slots)
-  # Realign pos/neg max_cumulative_sum to a shared baseline: post_mean if push,
-  # else snap_mean (keeps next-truncation comparison well-defined).
-  new_max_cumsum = jnp.where(push, post_mean, snap_mean_max_cumsum)
+  # Advance the write slot on trajectory end, not on push: the next full
+  # unroll writes into a fresh slot.
+  new_slots = jnp.where(any_done, (slots + 1) % buffer_size, slots)
 
   return (
       p_state.replace(state_buffer=new_pos_sb, task_param_buffer=new_pos_tpb,
-                      next_write_slot=new_slots,
-                      max_cumulative_sum=new_max_cumsum),
+                      next_write_slot=new_slots),
       n_state.replace(state_buffer=new_neg_sb, task_param_buffer=new_neg_tpb,
-                      next_write_slot=new_slots,
-                      max_cumulative_sum=new_max_cumsum),
+                      next_write_slot=new_slots),
   )
 
 
 _push_buffers_jit = jax.jit(_push_buffers_core, static_argnames=("buffer_size",))
 _push_buffers_pmap = jax.pmap(
     _push_buffers_core,
-    in_axes=(0, 0, 0, 0, 0, 0, 0, 0, 0, None),
-    static_broadcasted_argnums=(9,))
+    in_axes=(0, 0, 0, 0, 0, 0, 0, 0, None),
+    static_broadcasted_argnums=(8,))
 
 
 @flax.struct.dataclass
@@ -180,7 +183,7 @@ class PESWorkerState(gradient_learner.GradientEstimatorState):
   neg_state: TruncatedUnrollState
   accumulator: MetaParams
 
-@functools.partial(jax.jit, static_argnames=("std", "timer_obj", "sign_delta_loss_scalar", "samples_per_device", "device_idx"))
+@functools.partial(jax.jit, static_argnames=("std", "timer_obj", "sign_delta_loss_scalar", "samples_per_device", "device_idx", "imt_loss_type"))
 def compute_pes_grad(
     dirloss_weight: jnp.ndarray,
     magloss_weight: jnp.ndarray,
@@ -194,6 +197,7 @@ def compute_pes_grad(
     delta_loss_scalar_afsnm: Optional [float] = 0.01,
     samples_per_device: Optional[int] = None,
     device_idx: Optional[int] = None,
+    imt_loss_type: str = "decoupled",
 ):
   """Compute the PES gradient estimate from the outputs of many unrolls.
 
@@ -226,10 +230,24 @@ def compute_pes_grad(
 
   delta_direction_ori = p_ys.imt_cosine_loss - n_ys.imt_cosine_loss
   delta_magnitude_ori = p_ys.imt_magnitude_loss - n_ys.imt_magnitude_loss
-  delta_direction = second_moment_normalizer(delta_direction_ori, eps=0.0) * delta_loss_scalar_afsnm
-  delta_magnitude = second_moment_normalizer(delta_magnitude_ori, eps=0.0) * delta_loss_scalar_afsnm
+  delta_mse_ori = p_ys.imt_mse_loss - n_ys.imt_mse_loss
+  delta_direction = masked_second_moment_normalizer(
+      delta_direction_ori, p_ys.mask) * delta_loss_scalar_afsnm
+  delta_magnitude = masked_second_moment_normalizer(
+      delta_magnitude_ori, p_ys.mask) * delta_loss_scalar_afsnm
+  delta_mse = masked_second_moment_normalizer(
+      delta_mse_ori, p_ys.mask) * delta_loss_scalar_afsnm
   delta_task_losses = p_ys.task_loss - n_ys.task_loss
-  delta_losses = dirloss_weight * delta_direction + magloss_weight * delta_magnitude + (1.0 - dirloss_weight - magloss_weight) * delta_task_losses
+  if imt_loss_type == "mse":
+    # Plain-MSE baseline. The imitation-vs-task split is kept identical to the
+    # decoupled objective by reusing the sum of the two (already scheduled)
+    # weights, so the two runs differ only in the shape of the imitation term.
+    imt_weight = dirloss_weight + magloss_weight
+    delta_losses = imt_weight * delta_mse + (1.0 - imt_weight) * delta_task_losses
+  elif imt_loss_type == "decoupled":
+    delta_losses = dirloss_weight * delta_direction + magloss_weight * delta_magnitude + (1.0 - dirloss_weight - magloss_weight) * delta_task_losses
+  else:
+    raise ValueError(f"imt_loss_type must be 'decoupled' or 'mse', got {imt_loss_type!r}")
 
   if sign_delta_loss_scalar:
     sign_per_task = jnp.sign(jnp.mean(delta_losses * p_ys.mask, axis=0))
@@ -287,12 +305,13 @@ def compute_pes_grad(
 
   return (jnp.mean((pos_task_loss + neg_task_loss) / 2.0), es_grad,
           new_accumulator, p_ys, delta_losses, delta_task_losses,
-          delta_direction_ori, delta_magnitude_ori, snr_sample, snr_estimator,
-          snr_delta_loss)
+          delta_direction_ori, delta_magnitude_ori, delta_mse_ori,
+          snr_sample, snr_estimator, snr_delta_loss)
 
-@functools.partial(jax.jit, static_argnames=("std", "sign_delta_loss_scalar", "replicated"))
+@functools.partial(jax.jit, static_argnames=("std", "sign_delta_loss_scalar", "replicated", "imt_loss_type"))
 def _pes_grad_sharded_inner_elo(dirloss_weight, magloss_weight, p_ys, n_ys, accumulator, vec_pos, std,
-                                sign_delta_loss_scalar, replicated, delta_loss_scalar_afsnm=0.01):
+                                sign_delta_loss_scalar, replicated, delta_loss_scalar_afsnm=0.01,
+                                imt_loss_type="decoupled"):
   """JIT-compiled inner function: all-gather via sharding constraint, then PES gradient (ELO variant)."""
   # All-gather: replicate all sharded arrays across devices
   p_ys = jax.tree_util.tree_map(
@@ -307,10 +326,24 @@ def _pes_grad_sharded_inner_elo(dirloss_weight, magloss_weight, p_ys, n_ys, accu
   # Separate direction and magnitude IMT losses, normalize each independently
   delta_direction_ori = p_ys.imt_cosine_loss - n_ys.imt_cosine_loss
   delta_magnitude_ori = p_ys.imt_magnitude_loss - n_ys.imt_magnitude_loss
-  delta_direction = second_moment_normalizer(delta_direction_ori, eps=0.0) * delta_loss_scalar_afsnm
-  delta_magnitude = second_moment_normalizer(delta_magnitude_ori, eps=0.0) * delta_loss_scalar_afsnm
+  delta_mse_ori = p_ys.imt_mse_loss - n_ys.imt_mse_loss
+  delta_direction = masked_second_moment_normalizer(
+      delta_direction_ori, p_ys.mask) * delta_loss_scalar_afsnm
+  delta_magnitude = masked_second_moment_normalizer(
+      delta_magnitude_ori, p_ys.mask) * delta_loss_scalar_afsnm
+  delta_mse = masked_second_moment_normalizer(
+      delta_mse_ori, p_ys.mask) * delta_loss_scalar_afsnm
   delta_task_losses = p_ys.task_loss - n_ys.task_loss
-  delta_losses = dirloss_weight * delta_direction + magloss_weight * delta_magnitude + (1.0 - dirloss_weight - magloss_weight) * delta_task_losses
+  if imt_loss_type == "mse":
+    # Plain-MSE baseline. The imitation-vs-task split is kept identical to the
+    # decoupled objective by reusing the sum of the two (already scheduled)
+    # weights, so the two runs differ only in the shape of the imitation term.
+    imt_weight = dirloss_weight + magloss_weight
+    delta_losses = imt_weight * delta_mse + (1.0 - imt_weight) * delta_task_losses
+  elif imt_loss_type == "decoupled":
+    delta_losses = dirloss_weight * delta_direction + magloss_weight * delta_magnitude + (1.0 - dirloss_weight - magloss_weight) * delta_task_losses
+  else:
+    raise ValueError(f"imt_loss_type must be 'decoupled' or 'mse', got {imt_loss_type!r}")
 
   if sign_delta_loss_scalar:
     sign_per_task = jnp.sign(jnp.mean(delta_losses * p_ys.mask, axis=0))
@@ -371,6 +404,7 @@ def _pes_grad_sharded_inner_elo(dirloss_weight, magloss_weight, p_ys, n_ys, accu
       delta_task_losses,
       delta_direction_ori,
       delta_magnitude_ori,
+      delta_mse_ori,
       snr_sample,
       snr_estimator,
       snr_delta_loss,
@@ -393,6 +427,7 @@ def compute_pes_grad_sharded_elo(
     device_idx: int = 0,
     baseline_losses: Optional[list[float]] = None,
     delta_loss_scalar_afsnm: Optional[float] = 0.01,
+    imt_loss_type: str = "decoupled",
     mesh: Optional[Mesh] = None,
 ):
   """Compute PES gradient using JAX mesh-based sharding for multi-GPU all-gather (ELO variant).
@@ -454,13 +489,14 @@ def compute_pes_grad_sharded_elo(
 
   # JIT-compiled all-gather + PES gradient computation
   (loss, es_grad, new_accumulator, p_ys_out, delta_losses,
-   delta_task_losses, delta_direction_ori, delta_magnitude_ori,
+   delta_task_losses, delta_direction_ori, delta_magnitude_ori, delta_mse_ori,
    snr_sample, snr_estimator, snr_delta_loss) = _pes_grad_sharded_inner_elo(
       dirloss_weight, magloss_weight, p_ys, n_ys, accumulator, vec_pos,
       std=std,
       sign_delta_loss_scalar=sign_delta_loss_scalar,
       replicated=replicated,
       delta_loss_scalar_afsnm=delta_loss_scalar_afsnm,
+      imt_loss_type=imt_loss_type,
   )
 
   # Per-device slicing: extract this process's portion of per-task outputs
@@ -479,10 +515,11 @@ def compute_pes_grad_sharded_elo(
   delta_task_losses = delta_task_losses[:, start_idx:end_idx]
   delta_direction_ori = delta_direction_ori[:, start_idx:end_idx]
   delta_magnitude_ori = delta_magnitude_ori[:, start_idx:end_idx]
+  delta_mse_ori = delta_mse_ori[:, start_idx:end_idx]
 
   return (loss, es_grad, new_accumulator, p_ys_out, delta_losses,
           delta_task_losses, delta_direction_ori, delta_magnitude_ori,
-          snr_sample, snr_estimator, snr_delta_loss)
+          delta_mse_ori, snr_sample, snr_estimator, snr_delta_loss)
 
 
 @gin.configurable
@@ -518,7 +555,16 @@ class TruncatedPES_ELO(gradient_learner.GradientEstimator):
       expert_magloss_weight: float = 0.3,
       expert_dirloss_wmin: float = 0.0,
       expert_magloss_wmin: float = 0.0,
+      imt_loss_type: str = "decoupled",
   ):
+    # "decoupled" = dirloss_weight * (1 - cos) + magloss_weight * |norm gap|
+    # "mse"       = (dirloss_weight + magloss_weight) * mean((d_e - d_lo)^2)
+    # Both forms are always computed and logged; this only picks which one the
+    # meta-gradient follows, and keeps the imitation-vs-task split identical.
+    if imt_loss_type not in ("decoupled", "mse"):
+      raise ValueError("imt_loss_type must be 'decoupled' or 'mse', got "
+                       f"{imt_loss_type!r}")
+    self.imt_loss_type = imt_loss_type
     self.truncated_step = truncated_step
     self.std = std
     self.bc_type = bc_type
@@ -535,10 +581,13 @@ class TruncatedPES_ELO(gradient_learner.GradientEstimator):
     if pmap_across_devices:
       devices = mesh_utils.create_device_mesh((jax.device_count(),))
       self.mesh = Mesh(devices, axis_names=('devices',))
-      self.grad_fn = functools.partial(compute_pes_grad_sharded_elo, mesh=self.mesh)
+      self.grad_fn = functools.partial(compute_pes_grad_sharded_elo,
+                                       mesh=self.mesh,
+                                       imt_loss_type=imt_loss_type)
     else:
       self.mesh = None
-      self.grad_fn = compute_pes_grad
+      self.grad_fn = functools.partial(compute_pes_grad,
+                                       imt_loss_type=imt_loss_type)
     self.use_bc_grads = use_bc_grads
     self.expert_dirloss_weight = expert_dirloss_weight
     self.expert_magloss_weight = expert_magloss_weight
@@ -693,16 +742,17 @@ class TruncatedPES_ELO(gradient_learner.GradientEstimator):
       p_bc_grads_list.append(p_bc_grads)
       n_bc_grads_list.append(n_bc_grads)
 
-    # Post-truncation push: write pos/neg inner states to buffer when the
-    # trajectory struggled (CUSUM mean-max rose) or any reset fired this segment.
+    # Post-truncation push: write the pre-window snapshot to buffer when a new
+    # loss low occurred inside this window (improvement-CUSUM max rose). The
+    # write slot advances only when the trajectory ends (any_done).
     buffer_size = jax.tree_util.tree_leaves(p_state.state_buffer)[0].shape[1]
-    pos_is_done_stack = jnp.concatenate([y.is_done for y in p_yses], axis=0)
-    neg_is_done_stack = jnp.concatenate([y.is_done for y in n_yses], axis=0)
+    any_done = (jnp.any(jnp.stack([y.is_done for y in p_yses]), axis=(0, 1))
+                | jnp.any(jnp.stack([y.is_done for y in n_yses]), axis=(0, 1)))
     p_state, n_state = _push_buffers_jit(
         p_state, n_state,
         snap_pos_opt, snap_pos_tp, snap_neg_opt, snap_neg_tp,
         snap_mean_max_cumsum,
-        pos_is_done_stack, neg_is_done_stack,
+        any_done,
         buffer_size)
 
     if self.use_bc_grads:
@@ -725,8 +775,8 @@ class TruncatedPES_ELO(gradient_learner.GradientEstimator):
 
 
     (loss, es_grad, new_accumulator, p_ys, delta_losses, delta_task_losses,
-     delta_direction_ori, delta_magnitude_ori, snr_sample, snr_estimator,
-     snr_delta_loss) = self.grad_fn(
+     delta_direction_ori, delta_magnitude_ori, delta_mse_ori,
+     snr_sample, snr_estimator, snr_delta_loss) = self.grad_fn(
         dirloss_weight,
         magloss_weight,
         p_yses,
@@ -764,6 +814,7 @@ class TruncatedPES_ELO(gradient_learner.GradientEstimator):
       metrics["mean||delta_task_loss_mean"] = jnp.abs(delta_task_losses)
       metrics["mean||delta_direction_ori_mean"] = jnp.mean(jnp.abs(delta_direction_ori))
       metrics["mean||delta_magnitude_ori_mean"] = jnp.mean(jnp.abs(delta_magnitude_ori))
+      metrics["mean||delta_mse_ori_mean"] = jnp.mean(jnp.abs(delta_mse_ori))
       metrics["mean||expert_weight"] = state.pos_state.inner_opt_state.expert_weight
       metrics["mean||dirloss_weight"] = dirloss_weight
       metrics["mean||magloss_weight"] = magloss_weight
@@ -816,7 +867,8 @@ class TruncatedPESPMAP_ELO(TruncatedPES_ELO):
         functools.partial(compute_pes_grad,
                           jnp.asarray(self.expert_dirloss_weight),
                           jnp.asarray(self.expert_magloss_weight),
-                          std=self.std))
+                          std=self.std,
+                          imt_loss_type=self.imt_loss_type))
 
     self.pmap_vector_sample_perturbations = jax.pmap(
         functools.partial(
@@ -945,20 +997,22 @@ class TruncatedPESPMAP_ELO(TruncatedPES_ELO):
       n_yses.append(n_ys)
 
     # Post-truncation push (pmap variant): state_buffer leaves are
-    # (num_devices, num_tasks, buffer_size, ...); is_done is
-    # (num_devices, steps_per_jit, num_tasks), so concat on step axis (axis=1).
+    # (num_devices, num_tasks, buffer_size, ...). Push the pre-window snapshot
+    # when a new loss low occurred inside this window (improvement-CUSUM max
+    # rose); the write slot advances only on trajectory end. is_done is
+    # (num_devices, steps_per_jit, num_tasks) -> reduce over the step axis.
     buffer_size = jax.tree_util.tree_leaves(p_state.state_buffer)[0].shape[2]
-    pos_is_done_stack = jnp.concatenate([y.is_done for y in p_yses], axis=1)
-    neg_is_done_stack = jnp.concatenate([y.is_done for y in n_yses], axis=1)
+    any_done = (jnp.any(jnp.concatenate([y.is_done for y in p_yses], axis=1), axis=1)
+                | jnp.any(jnp.concatenate([y.is_done for y in n_yses], axis=1), axis=1))
     p_state, n_state = _push_buffers_pmap(
         p_state, n_state,
         snap_pos_opt, snap_pos_tp, snap_neg_opt, snap_neg_tp,
         snap_mean_max_cumsum,
-        pos_is_done_stack, neg_is_done_stack,
+        any_done,
         buffer_size)
 
     (loss, es_grad, new_accumulator, p_ys, delta_losses, delta_task_losses,
-     delta_direction_ori, delta_magnitude_ori, snr_sample,
+     delta_direction_ori, delta_magnitude_ori, delta_mse_ori, snr_sample,
      snr_estimator, snr_delta_loss) = self.pmap_compute_pes_grad(
         p_yses, n_yses, accumulator, vec_pos)
 
@@ -992,6 +1046,7 @@ class TruncatedPESPMAP_ELO(TruncatedPES_ELO):
       metrics["mean||delta_task_loss_mean"] = jnp.abs(delta_task_losses)
       metrics["mean||delta_direction_ori_mean"] = jnp.mean(jnp.abs(delta_direction_ori))
       metrics["mean||delta_magnitude_ori_mean"] = jnp.mean(jnp.abs(delta_magnitude_ori))
+      metrics["mean||delta_mse_ori_mean"] = jnp.mean(jnp.abs(delta_mse_ori))
       if hasattr(p_state, "inner_step"):
         metrics["sample||inner_step"] = p_state.inner_step[0]
         # metrics["sample||end_inner_step"] = p_state.inner_step[0]

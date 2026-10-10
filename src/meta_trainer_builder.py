@@ -36,10 +36,65 @@ from learned_optimizers import build_learned_optimizer
 ############################################################################  
 import inspect
 
-def build_from_dict(cls, kwargs):
+# Config/CLI spellings that do not match the constructor parameter name.
+# `--cfg_options gradient_estimator_args.kwargs.<key>=...` is matched against the
+# class signature, so a key that is not a real parameter is silently dropped --
+# it looks like it works and changes nothing. Map the historical spellings here
+# instead of editing the ~280 job scripts that use them.
+KWARG_ALIASES = {
+    "truncation_length": "trunc_length",
+}
+
+# Keys the build_* helpers inject for every class; classes that do not take them
+# drop them on purpose, so they must not warn.
+_INJECTED_KEYS = frozenset({
+    # build_gradient_estimator
+    "truncated_step", "baseline_losses", "timer_obj", "truncation_schedule",
+    # build_truncated_step
+    "task_family", "learned_opt", "trunc_sched", "task_name", "num_tasks",
+    "num_local_steps", "gradient_accumulation_steps", "use_bc_grads",
+    "global_num_particles",
+})
+
+# Keys that live in the config dict but are read straight out of it elsewhere
+# (meta_trainers.default_meta_trainer, build_truncated_step) rather than being
+# passed to the estimator constructor. They are not typos, so they must not warn
+# -- and they must not be deleted from the configs either: those readers index
+# them with [] and would raise KeyError.
+_CONSUMED_ELSEWHERE_KEYS = frozenset({
+    "use_baseline_losses", "bc_grad_weight", "pmap_across_devices",
+})
+
+
+def build_from_dict(cls, kwargs, warn_dropped=True):
     sig = inspect.signature(cls)
     valid_keys = set(sig.parameters.keys())
+
+    # The real name always arrives from the config file's default, so an alias
+    # and the real name coexisting is the normal case, not a conflict: the alias
+    # can only come from a config/--cfg_options entry the user wrote by hand, so
+    # it wins. Say so out loud, since overriding silently is how this class of
+    # bug stayed invisible in the first place.
+    kwargs = dict(kwargs)
+    for alias, real in KWARG_ALIASES.items():
+        if alias not in kwargs:
+            continue
+        value = kwargs.pop(alias)
+        if real not in valid_keys:
+            continue
+        if real in kwargs and kwargs[real] != value:
+            print(f"[config] {cls.__name__}: {alias}={value!r} overrides "
+                  f"{real}={kwargs[real]!r} ({alias} is an alias for {real}).")
+        kwargs[real] = value
+
     filtered = {k: v for k, v in kwargs.items() if k in valid_keys}
+    if warn_dropped:
+        unknown = sorted(set(kwargs) - valid_keys - _INJECTED_KEYS
+                         - _CONSUMED_ELSEWHERE_KEYS)
+        if unknown:
+            print(f"[config] WARNING: {cls.__name__} has no parameter(s) "
+                  f"{unknown} -- these values are ignored. Valid parameters: "
+                  f"{sorted(valid_keys - {'self'})}")
     return cls(**filtered)
 
 GRADIENT_ESTIMATORS = {
@@ -283,11 +338,16 @@ def build_truncated_step(args, task_family, learned_opt, inner_length_schedule):
     ts_kwargs['num_tasks'] = args.num_tasks
     ts_kwargs['num_local_steps'] = args.num_local_steps
     ts_kwargs['gradient_accumulation_steps'] = getattr(args, 'gradient_accumulation_steps', 1)
-    ts_kwargs['random_initial_iteration_offset'] = args.num_inner_steps
+    # random_initial_iteration_offset stays whatever the config / --cfg_options
+    # set (config/truncated_step/lopt*.py default it to 1000). It used to be
+    # overwritten here with args.num_inner_steps, which silently discarded the
+    # configured value; the two happen to be equal (both 1000) for every
+    # meta-train script, so honouring the config changes nothing today and
+    # stops the divergence the moment --num_inner_steps is passed.
     ts_kwargs['use_bc_grads'] = getattr(args, 'bc_grad_weight', None)
     ts_kwargs['global_num_particles'] = (
         args.world_size * ts_kwargs['num_tasks']
-        if args.gradient_estimator_args['kwargs']['pmap_across_devices']
+        if args.gradient_estimator_args['kwargs'].get('pmap_across_devices', False)
         else ts_kwargs['num_tasks']
     )
 

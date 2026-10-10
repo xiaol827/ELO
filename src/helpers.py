@@ -359,6 +359,37 @@ def get_ckpt_to_load(ckpt_dir, dirs):
 
 
 
+def _atomic_wandb_download(ckpt, parent_dir):
+    """Download a wandb run file to parent_dir/<ckpt.name> without ever exposing a
+    partially written file.
+
+    parent_dir is shared by every run on the cluster ($SCRATCH/checkpoints/test_cpkts),
+    so concurrent jobs loading the same checkpoint used to overwrite each other in place
+    (download(replace=True)) and could unpickle a half-written file. Download into a
+    private temp dir instead and os.replace() into place: readers see either the old
+    complete file or the new complete one.
+    """
+    local_path = osp.join(parent_dir, ckpt.name)
+    tmp_dir = tempfile.mkdtemp(prefix='.dl_', dir=parent_dir)
+    try:
+        ckpt.download(tmp_dir, replace=True)
+        tmp_path = osp.join(tmp_dir, ckpt.name)
+        if not osp.exists(tmp_path):
+            # 部分 wandb 版本下载时会丢弃子目录，只保留文件名
+            alt_tmp = osp.join(tmp_dir, osp.basename(ckpt.name))
+            if not osp.exists(alt_tmp):
+                raise FileNotFoundError(
+                    f"wandb download silently failed for {ckpt.name}. Tried:\n"
+                    f"  {tmp_path}\n  {alt_tmp}")
+            print(f'Warning: wandb dropped the subdirectory of {ckpt.name}')
+            tmp_path = alt_tmp
+        os.makedirs(osp.dirname(local_path), exist_ok=True)
+        os.replace(tmp_path, local_path)
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+    return local_path
+
+
 def download_wandb_checkpoint(cfg):
     api = wandb.Api()
     run = api.run(cfg.wandb_checkpoint_id)
@@ -369,20 +400,7 @@ def download_wandb_checkpoint(cfg):
     os.makedirs(parent_dir, exist_ok=True)
     def _download_and_resolve(ckpt, parent_dir):
         print('Downloading checkpoint:', ckpt.name)
-        ckpt.download(parent_dir, replace=True)
-        local_path = osp.join(parent_dir, ckpt.name)
-        if osp.exists(local_path):
-            return local_path
-        # 部分 wandb 版本下载时会丢弃子目录，只保留文件名
-        alt_path = osp.join(parent_dir, osp.basename(ckpt.name))
-        if osp.exists(alt_path):
-            print(f'Warning: checkpoint found at alt path {alt_path}')
-            return alt_path
-        raise FileNotFoundError(
-            f"wandb download silently failed. File not found at:\n"
-            f"  {local_path}\n"
-            f"  {alt_path}"
-        )
+        return _atomic_wandb_download(ckpt, parent_dir)
 
     if "velo_ckpt.pickle" == cfg.selected_checkpoint:
         ckpt = run.file("velo_ckpt.pickle")
@@ -488,52 +506,38 @@ def build_checkpoint_soup(cfg):
 
     def _download_one(ckpt):
         print(f"[ckpt soup] downloading {ckpt.name}")
-        ckpt.download(parent_dir, replace=True)
-        local_path = osp.join(parent_dir, ckpt.name)
-        if osp.exists(local_path):
-            return local_path
-        alt_path = osp.join(parent_dir, osp.basename(ckpt.name))
-        if osp.exists(alt_path):
-            return alt_path
-        raise FileNotFoundError(
-            f"wandb download silently failed for {ckpt.name}. Tried:\n  {local_path}\n  {alt_path}"
-        )
+        return _atomic_wandb_download(ckpt, parent_dir)
 
     local_paths = [_download_one(c) for _, c in in_range]
 
     print(f"[ckpt soup] averaging {len(local_paths)} checkpoint(s)...")
     avg_params = _average_pickled_pytrees(local_paths)
 
-    with open(soup_path, 'wb') as f:
+    tmp_path = f"{soup_path}.tmp.{os.getpid()}"
+    with open(tmp_path, 'wb') as f:
         pickle.dump(avg_params, f, protocol=4)
+    os.replace(tmp_path, soup_path)
     print(f"[ckpt soup] wrote averaged checkpoint to {soup_path}")
     return soup_path
 
 
-def test_bf16_support_on_gpu():
-    # Check if there is any GPU available
-    gpus = jax.devices()#[device for device in jax.devices() if 'gpu' in device.device_kind.lower()]
-    if not gpus:
-        print("No GPU devices found.")
-        return
-    
-    # Select the first GPU device
-    gpu = gpus[0]
-    jax.devices().append(gpu)
-    print(f"Testing on GPU: {gpu}")
-
+def test_bf16_support_on_gpu() -> bool:
+    """Return True iff a bf16 add and a bf16 matmul run on the default backend."""
+    devices = jax.devices()
+    if not devices:
+        print("No devices found.")
+        return False
+    print(f"Testing bf16 on: {devices[0]}")
     try:
-        # Create test data in BF16
-        a = lax.convert_element_type(np.array([1.0, 2.0, 3.0]), jnp.bfloat16)
-        b = lax.convert_element_type(np.array([1.0, 2.0, 3.0]), jnp.bfloat16)
-        
-        # Perform an addition operation on GPU
-        result = lax.add(a, b)
-
-        # Print the results to verify
-        print("BF16 operation successful on GPU. Result:", result)
+        a = jnp.asarray(np.array([[1.0, 2.0], [3.0, 4.0]]), dtype=jnp.bfloat16)
+        s = lax.add(a, a)
+        m = jnp.dot(a, a, preferred_element_type=jnp.float32)
+        ok = bool(jnp.all(s == 2 * a)) and m.dtype == jnp.float32 and bool(jnp.allclose(m, jnp.dot(a.astype(jnp.float32), a.astype(jnp.float32))))
+        print("BF16 operation successful." if ok else "BF16 result mismatch.")
+        return ok
     except Exception as e:
-        print(f"Failed to perform BF16 operations on GPU: {e}")
+        print(f"Failed to perform BF16 operations: {e}")
+        return False
 
 def get_resume_ckpt(ckpt_dir, meta_train_name):
 

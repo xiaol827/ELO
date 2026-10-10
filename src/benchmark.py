@@ -396,30 +396,44 @@ def _peek_bench_resume(name):
     return wandb_run_id, start_iteration
 
 
+# Run settings that determine the training trajectory. A checkpoint is only resumed
+# by a run whose values for these are identical; the resume dir is matched by
+# args.name alone, so without this check a re-launch with e.g. a different lr but
+# the same name_suffix would silently continue the old run's checkpoint.
+_RESUME_CONFIG_KEYS = (
+    'task', 'optimizer', 'test_checkpoint', 'learned_optimizer_args', 'optimizer_args',
+    'schedule', 'gradient_transform_before_optim', 'gradient_transform_after_optim',
+    'num_inner_steps', 'local_batch_size', 'gradient_accumulation_steps', 'seed',
+    'test_accumulate_steps', 'ovr_test_batch_size', 'use_bf16',
+)
+
+
+def _resume_config(args):
+    return {k: config_to_dict(getattr(args, k, None)) for k in _RESUME_CONFIG_KEYS}
+
+
 def _load_bench_checkpoint(args, opt_state):
     """
     Load opt_state and metadata from the latest benchmark checkpoint matching args.name.
-    All ranks call this independently (shared filesystem).
-    Returns (opt_state, start_iteration, key, wandb_run_id, last_test_log),
-    or original values if not found.
-
+    All ranks call this independently (shared filesystem). Callers only get here
+    after _peek_bench_resume found a checkpoint, so a missing file is an error.
+    Returns (opt_state, start_iteration, key, wandb_run_id, last_test_log,
+    train_consumed, test_consumed).
     """
     outer_dir = _find_bench_resume_dir(args.name)
     if outer_dir is None:
-        print_rank_0("[bench resume] No checkpoint found, starting fresh.")
-
-        return opt_state, 0, None, None, {}
-
-
+        raise FileNotFoundError(f"[bench resume] no checkpoint dir for name {args.name!r}")
     step_name = open(os.path.join(outer_dir, 'latest')).read().strip()
     ckpt_path = os.path.join(outer_dir, f'{step_name}.pkl')
 
-    if not os.path.isfile(ckpt_path):
-        print_rank_0(f"[bench resume] Checkpoint incomplete in {outer_dir}, starting fresh.")
-        return opt_state, 0, None, None, {}
-
     with open(ckpt_path, 'rb') as f:
         ckpt = pickle.load(f)
+
+    current = _resume_config(args)
+    if ckpt['config'] != current:
+        diff = {k: (ckpt['config'].get(k), current[k]) for k in current if ckpt['config'].get(k) != current[k]}
+        raise RuntimeError(f"[bench resume] {ckpt_path} was saved by a run with different settings "
+                           f"(checkpoint, current): {diff}")
 
     device = jax.local_devices()[0]
     opt_state = jax.device_put(ckpt['opt_state'], device)
@@ -428,13 +442,21 @@ def _load_bench_checkpoint(args, opt_state):
 
     print_rank_0(f"[bench resume] Resuming from step {start_iteration} ({ckpt_path})")
 
-    return opt_state, start_iteration, key, ckpt['wandb_run_id'], ckpt['last_test_log']
+    return (opt_state, start_iteration, key, ckpt['wandb_run_id'], ckpt['last_test_log'],
+            ckpt['train_consumed'], ckpt['test_consumed'])
 
 
-def _save_bench_checkpoint(args, iteration, opt_state, key, wandb_run_id, last_test_log):
+def _save_bench_checkpoint(args, iteration, opt_state, key, wandb_run_id, last_test_log,
+                           train_consumed=None, test_consumed=None):
     """
     Save inner-loop checkpoint. Only rank 0 writes to disk.
     Keeps the last `args.checkpoints_to_keep` (default 2) checkpoints.
+
+    train_consumed / test_consumed: number of batches drawn from the train/test
+    data iterators so far. Stored so resume can seek the (deterministic) data
+    pipeline back to the exact same position; without this, resume reads
+    different batches and the val loss changes. None for iterators that do not
+    support seeking (image tfds pipelines); such a checkpoint cannot be resumed.
     """
     if args.rank != 0:
         return
@@ -450,6 +472,9 @@ def _save_bench_checkpoint(args, iteration, opt_state, key, wandb_run_id, last_t
             'key': np.array(key),
             'wandb_run_id': wandb_run_id,
             'last_test_log': {k: float(v) for k, v in last_test_log.items()},
+            'train_consumed': train_consumed,
+            'test_consumed': test_consumed,
+            'config': _resume_config(args),
         }, f, protocol=4)
 
     with open(os.path.join(outer_dir, 'latest'), 'w') as f:
@@ -674,10 +699,25 @@ def benchmark(args, sweep=False):
 
         resumed_test_log = {}
         if start_iteration > 0:
-            opt_state, start_iteration, resume_key, _, resumed_test_log = _load_bench_checkpoint(args, opt_state)
+            (opt_state, start_iteration, key, _, resumed_test_log,
+             train_consumed, test_consumed) = _load_bench_checkpoint(args, opt_state)
 
-            if resume_key is not None:
-                key = resume_key
+            # Restore the data-pipeline position so the resumed run reads the same
+            # train/test batches as a continuous run (fineweb loader is deterministic).
+            # Without this the resumed run re-reads the shard from the start and the
+            # train/test loss trajectory changes. A non-seekable pipeline (image tfds)
+            # cannot resume faithfully, so refuse rather than continue on wrong data.
+            if train_consumed is None or test_consumed is None:
+                raise RuntimeError("[bench resume] checkpoint has no data-pipeline position; "
+                                   "this task's data iterators are not seekable, resume is unsupported")
+            task.datasets.train.seek_to(train_consumed)
+            task.datasets.test.seek_to(test_consumed)
+            print_rank_0(f"[bench resume] train/test iterators seeked to {train_consumed}/{test_consumed} batches")
+
+        # opt_state lives as a global (replicated) array for the whole run; the
+        # jitted step consumes and returns it as such. Only test eval and
+        # checkpoint save pull local copies (update.to_local).
+        opt_state = update.to_global(opt_state)
 
         if args.use_localsgd_batches:
             try:
@@ -688,8 +728,6 @@ def benchmark(args, sweep=False):
             local_inner_opt_state = jax.tree_util.tree_map(
                     lambda x: jnp.stack([x] * args.num_grads),
                     local_inner_opt_state)
-
-        prev_params = jax.tree_util.tree_map(lambda x: jnp.array(x, copy=True), params)
 
         save_iter = getattr(args, 'save_iter', 500)
         time_limit_secs = (getattr(args, 'time_limit_hours', None) or 0) * 3600
@@ -703,7 +741,7 @@ def benchmark(args, sweep=False):
             desc="Inner Loop",
             disable=args.rank != 0
         )
-        train_load_time, grad_time, stepl, test_time = [],[],[],[]
+        train_load_time, step_time, test_time = [], [], []
         test_log = dict(resumed_test_log)
         test_loss = test_log.get('test loss', 0)
         test_acc = test_log.get('test accuracy', 0)
@@ -716,40 +754,28 @@ def benchmark(args, sweep=False):
 
             key, key1 = jax.random.split(key)
 
+            # Whole-step wall time (fw + bw + optimizer update). Dispatch is
+            # async, so block on the new opt_state before reading the clock.
+            step_start = time.time()
+            if args.use_localsgd_batches:
+                opt_state, local_inner_opt_state, loss, _ = update(opt_state, local_inner_opt_state, key1, batch)
+                metrics = {}
+            else:
+                # metrics: l2 norms computed inside the jitted step when
+                # --log_param_norms is set, else empty
+                opt_state, loss, metrics = update(opt_state, key1, batch)
+            jax.block_until_ready(opt_state)
+            step_time.append(time.time() - step_start)
 
-
-            with Timing('fw bw full', grad_time):
-                # opt_state, loss, grad, aux = update(opt_state, key1, batch)
-                if args.use_localsgd_batches:
-                    opt_state, local_inner_opt_state, loss, grad = update(opt_state, local_inner_opt_state, key1, batch)
-                else:
-                    # print_rank_0("batch.keys(): ", batch.keys())
-                    opt_state, loss, grad = update(opt_state, key1, batch)
-
-
-                to_log = {
-                        "train loss": loss,
-                    }
+            to_log = {
+                    "train loss": loss,
+                }
 
             params = opt.get_params(opt_state)
             state = opt.get_state(opt_state)
 
 
             if args.rank == 0:
-                # L2 norm of gradients
-                grad_leaves = jax.tree_util.tree_leaves(grad)
-                l2_grads = jnp.sqrt(sum(jnp.sum(g ** 2) for g in grad_leaves))
-
-                # L2 norm of parameters
-                param_leaves = jax.tree_util.tree_leaves(params)
-                l2_params = jnp.sqrt(sum(jnp.sum(p ** 2) for p in param_leaves))
-
-                # L2 norm of updates (param delta)
-                update_leaves = jax.tree_util.tree_leaves(
-                    jax.tree_util.tree_map(lambda p, pp: p - pp, params, prev_params)
-                )
-                l2_updates = jnp.sqrt(sum(jnp.sum(u ** 2) for u in update_leaves))
-
                 # Learning rate: explicit schedule for hand-crafted optimizers,
                 # read from opt_state.scheduled_lr for learned optimizers
                 if hasattr(opt, 'get_current_lr'):
@@ -759,12 +785,8 @@ def benchmark(args, sweep=False):
                 else:
                     raise RuntimeError("Cannot determine LR: optimizer has no get_current_lr() and opt_state has no scheduled_lr")
 
-                to_log.update({
-                    "l2_grads": float(l2_grads),
-                    "l2_params": float(l2_params),
-                    "l2_updates": float(l2_updates),
-                    "lr": lr_value,
-                })
+                to_log.update({k: float(v) for k, v in metrics.items()})
+                to_log["lr"] = lr_value
 
             with Timing('test',test_time):
                 #test loss and accuracy if implemented
@@ -772,8 +794,9 @@ def benchmark(args, sweep=False):
                    and (iteration % args.test_interval == 0 \
                         or iteration == 0 \
                         or iteration == args.num_inner_steps-1):
+                    local_opt_state = update.to_local(opt_state)
                     test_loss, test_acc, test_log, key = evaluate_test(
-                        args, task, opt, opt_state, params, key
+                        args, task, opt, local_opt_state, opt.get_params(local_opt_state), key
                     )
                     to_log.update(test_log)
                     ran_test = True
@@ -786,9 +809,7 @@ def benchmark(args, sweep=False):
                 current_lr = float(opt.get_current_lr(iteration)) if hasattr(opt, "get_current_lr") else 0.0
                 pbar.set_postfix({
                     "data":round(train_load_time[-1],4),
-                    "fwbw":round(Timing.run_times_dict["fw bw"][-1],4),
-                    "opt":round(Timing.run_times_dict["optimizer step"][-1],4),
-                    "AR":round(Timing.run_times_dict["AR"][-1],4),
+                    "step":round(step_time[-1],4),
                     "test":round(test_time[-1],4),
                     "train loss":round(float(loss),2),
                     "test loss":round(float(test_loss),2) if ran_test else 0,
@@ -798,12 +819,10 @@ def benchmark(args, sweep=False):
 
                 # log
                 to_log.update({
-                    "train_opt_time": Timing.run_times_dict["optimizer step"][-1],
-                    "train_step_time": Timing.run_times_dict["fw bw"][-1],
-                    "AR time":Timing.run_times_dict["AR"][-1],
-                    "train_fwd_time": round(test_time[-1],4),
+                    "train_step_time": step_time[-1],
+                    "data_time": train_load_time[-1],
+                    "test_time": test_time[-1],
                     "learning_rate": current_lr,
-                    
                 })
 
             # to_log.update(flatten_dict(grad, parent_key='', sep='_'))
@@ -829,11 +848,11 @@ def benchmark(args, sweep=False):
             if args.rank == 0:
                 run.log(to_log, step=iteration)
 
-            prev_params = jax.tree_util.tree_map(lambda x: jnp.array(x, copy=True), params)
-
             # Periodic checkpoint save
             if wandb_run_id is not None and (iteration + 1) % save_iter == 0:
-                _save_bench_checkpoint(args, iteration, opt_state, key, wandb_run_id, test_log)
+                _save_bench_checkpoint(args, iteration, update.to_local(opt_state), key, wandb_run_id, test_log,
+                                       train_consumed=getattr(task.datasets.train, 'consumed', None),
+                                       test_consumed=getattr(task.datasets.test, 'consumed', None))
 
             # Time-limit checkpoint: save and exit cleanly so the next SLURM job can resume
             if time_limit_secs > 0 and (time.time() - job_start_time) >= time_limit_secs:
@@ -842,14 +861,18 @@ def benchmark(args, sweep=False):
                     f"after step {iteration + 1}. Saving checkpoint and exiting for next job."
                 )
                 if wandb_run_id is not None:
-                    _save_bench_checkpoint(args, iteration, opt_state, key, wandb_run_id, test_log)
+                    _save_bench_checkpoint(args, iteration, update.to_local(opt_state), key, wandb_run_id, test_log,
+                                           train_consumed=getattr(task.datasets.train, 'consumed', None),
+                                           test_consumed=getattr(task.datasets.test, 'consumed', None))
                 if args.rank == 0:
                     run.finish()
                 sys.exit(0)
 
         # Final checkpoint at end of run
         if wandb_run_id is not None:
-            _save_bench_checkpoint(args, args.num_inner_steps - 1, opt_state, key, wandb_run_id, test_log)
+            _save_bench_checkpoint(args, args.num_inner_steps - 1, update.to_local(opt_state), key, wandb_run_id, test_log,
+                                   train_consumed=getattr(task.datasets.train, 'consumed', None),
+                                   test_consumed=getattr(task.datasets.test, 'consumed', None))
 
 
         if args.rank == 0:

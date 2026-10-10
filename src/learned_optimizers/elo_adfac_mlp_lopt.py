@@ -128,11 +128,11 @@ def _newton_schulz_iteration(G, ns_steps=5, ns_coeffs=(3.4445, -4.7750, 2.0315))
 
 
 def muon_expert(param, m, adam_m, v, grad, t, lr, wd,
-                beta1=0.95, adam_beta1=0.9, beta2=0.999, ns_steps=5, eps=1e-8,
+                beta=0.95, adam_beta1=0.9, adam_beta2=0.999, ns_steps=5, eps=1e-8,
                 adamlr_scaler=0.1):
   """Muon expert matching optax.contrib.muon logic.
 
-  For 2D parameters: Nesterov momentum (beta1=0.95) -> NS orthogonalization -> shape scaling.
+  For 2D parameters: Nesterov momentum (beta=0.95) -> NS orthogonalization -> shape scaling.
   For non-2D parameters: AdamW fallback (adam_beta1=0.9).
 
   Args:
@@ -144,9 +144,9 @@ def muon_expert(param, m, adam_m, v, grad, t, lr, wd,
     t: current step (1-indexed).
     lr: learning rate.
     wd: weight decay.
-    beta1: muon momentum coefficient (default 0.95).
+    beta: muon momentum coefficient (default 0.95).
     adam_beta1: adam fallback momentum coefficient (default 0.9).
-    beta2: second moment coefficient (used for AdamW fallback).
+    adam_beta2: second moment coefficient (used for AdamW fallback).
     ns_steps: number of Newton-Schulz iterations.
     eps: epsilon for AdamW numerical stability.
 
@@ -156,9 +156,9 @@ def muon_expert(param, m, adam_m, v, grad, t, lr, wd,
   if param.ndim == 2:
     # Nesterov momentum with bias correction (matching optax scale_by_muon)
     # mu_hat = beta * bc(m, t+1) + (1-beta) * bc(grad, t)
-    bc_m = m / (1.0 - beta1**(t + 1))
-    bc_g = grad / (1.0 - beta1**t)
-    mu_hat = beta1 * bc_m + (1.0 - beta1) * bc_g
+    bc_m = m / (1.0 - beta**(t + 1))
+    bc_g = grad / (1.0 - beta**t)
+    mu_hat = beta * bc_m + (1.0 - beta) * bc_g
 
     n, k = mu_hat.shape
     need_transpose = n < k
@@ -171,7 +171,7 @@ def muon_expert(param, m, adam_m, v, grad, t, lr, wd,
     return param - lr * (update + wd * param)
   else:
     # For non-2D params (bias, embedding, scalar): AdamW fallback with adam_beta1=0.9
-    return adam_expert(param, adam_m, v, adam_beta1, beta2, t, lr * adamlr_scaler, wd, eps)
+    return adam_expert(param, adam_m, v, adam_beta1, adam_beta2, t, lr * adamlr_scaler, wd, eps)
 
 
 @gin.configurable
@@ -197,10 +197,15 @@ class ELO_AdafacMLPLOpt(lopt_base.LearnedOptimizer):
                make_separate_weights=False,
                split_weights=False,
                meta_train=True,
+               expert_only=False,
                use_lo_cosine_scheduler=False,
                step_mult_min=1e-4,
                expert_optim="adamw",
                muon_expert_adamlr_scaler=0.1,
+               exp_sgdm_mom_idx=0,
+               exp_adam_mom_idx=0,
+               exp_muon_mom_idx=1,
+               exp_adam_rms_idx=-1,
                init_lr=0.0,
                warmup_fraction=0.05,
                warmup_steps=0):
@@ -223,10 +228,15 @@ class ELO_AdafacMLPLOpt(lopt_base.LearnedOptimizer):
     self.weight_decay = weight_decay
     self.expert_weight_decay = expert_weight_decay
     self.meta_train=meta_train
+    self.expert_only = expert_only
     self.use_lo_cosine_scheduler = use_lo_cosine_scheduler
     self.step_mult_min = step_mult_min
     self.expert_optim = expert_optim  # "adamw", "sgdm", or "muon"
     self.muon_expert_adamlr_scaler = muon_expert_adamlr_scaler
+    self.exp_sgdm_mom_idx = exp_sgdm_mom_idx
+    self.exp_adam_mom_idx = exp_adam_mom_idx
+    self.exp_muon_mom_idx = exp_muon_mom_idx
+    self.exp_adam_rms_idx = exp_adam_rms_idx
     self.init_lr = init_lr
     self.warmup_fraction = warmup_fraction
     self.warmup_steps = warmup_steps
@@ -636,20 +646,26 @@ class ELO_AdafacMLPLOpt(lopt_base.LearnedOptimizer):
             opt_state.iteration, parent.expert_lr_decay_steps,
             parent.expert_lr_max, parent.expert_lr_min)
 
-        if self.meta_train:
+        if self.meta_train or parent.expert_only:
           # expert trajectory — dispatch based on expert_optim
+          # channel indices configurable via parent
+          exp_sgdm_mom_idx = parent.exp_sgdm_mom_idx
+          exp_adam_mom_idx = parent.exp_adam_mom_idx
+          exp_muon_mom_idx = parent.exp_muon_mom_idx
+          exp_adam_rms_idx = parent.exp_adam_rms_idx
+
           if parent.expert_optim == "adamw":
             next_params_expert = jax.tree_util.tree_map(
                     lambda p, m, v: adam_expert(
                         p, m, v,
-                        parent._initial_momentum_decays[0],
-                        parent._initial_rms_decays[0],
+                        parent._initial_momentum_decays[exp_adam_mom_idx],
+                        parent._initial_rms_decays[exp_adam_rms_idx],
                         opt_state.iteration + 1,
                         current_expert_lr,
                         parent.expert_weight_decay),
                     current_params,
-                    jax.tree_util.tree_map(lambda x: x[..., 0], next_mom_rolling.m),
-                    jax.tree_util.tree_map(lambda x: x[..., 0], next_rms_rolling.rms))
+                    jax.tree_util.tree_map(lambda x: x[..., exp_adam_mom_idx], next_mom_rolling.m),
+                    jax.tree_util.tree_map(lambda x: x[..., exp_adam_rms_idx], next_rms_rolling.rms))
           elif parent.expert_optim == "sgdm":
             next_params_expert = jax.tree_util.tree_map(
                     lambda p, m: sgdm_expert(
@@ -657,7 +673,7 @@ class ELO_AdafacMLPLOpt(lopt_base.LearnedOptimizer):
                         current_expert_lr,
                         parent.expert_weight_decay),
                     current_params,
-                    jax.tree_util.tree_map(lambda x: x[..., 0], next_mom_rolling.m))
+                    jax.tree_util.tree_map(lambda x: x[..., exp_sgdm_mom_idx], next_mom_rolling.m))
           elif parent.expert_optim == "muon":
             next_params_expert = jax.tree_util.tree_map(
                     lambda p, m, am, v, g: muon_expert(
@@ -665,17 +681,18 @@ class ELO_AdafacMLPLOpt(lopt_base.LearnedOptimizer):
                         opt_state.iteration + 1,
                         current_expert_lr,
                         parent.expert_weight_decay,
-                        beta1=parent._initial_momentum_decays[1],
-                        adam_beta1=parent._initial_momentum_decays[0],
-                        beta2=parent._initial_rms_decays[0],
+                        beta=parent._initial_momentum_decays[exp_muon_mom_idx],
+                        adam_beta1=parent._initial_momentum_decays[exp_adam_mom_idx],
+                        adam_beta2=parent._initial_rms_decays[exp_adam_rms_idx],
                         ns_steps=5,
                         adamlr_scaler=parent.muon_expert_adamlr_scaler),
                     current_params,
-                    jax.tree_util.tree_map(lambda x: x[..., 1], next_mom_rolling.m),
-                    jax.tree_util.tree_map(lambda x: x[..., 0], next_mom_rolling.m),
-                    jax.tree_util.tree_map(lambda x: x[..., 0], next_rms_rolling.rms),
+                    jax.tree_util.tree_map(lambda x: x[..., exp_muon_mom_idx], next_mom_rolling.m),
+                    jax.tree_util.tree_map(lambda x: x[..., exp_adam_mom_idx], next_mom_rolling.m),
+                    jax.tree_util.tree_map(lambda x: x[..., exp_adam_rms_idx], next_rms_rolling.rms),
                     grad)
 
+        if self.meta_train:
           next_params = jax.tree_util.tree_map(lambda p1, p2:  opt_state.expert_weight * p1 + (1.0 - opt_state.expert_weight) * p2, next_params_expert, next_params_lo)
           # next_params = next_params_lo
 
@@ -695,6 +712,12 @@ class ELO_AdafacMLPLOpt(lopt_base.LearnedOptimizer):
           # magnitude_loss = jnp.mean(jnp.abs(jnp.abs(flat_update_expert) - jnp.abs(flat_update_lo)))
           magnitude_loss = jnp.abs(norm_lo - norm_expert)
 
+          # Plain MSE between the two updates -- the coupled baseline the
+          # (cosine, magnitude) pair is meant to improve on. Always computed so
+          # both objectives are logged side by side; which one actually drives
+          # the meta-gradient is picked by the estimator's imt_loss_type.
+          mse_loss = jnp.mean(jnp.square(flat_update_expert - flat_update_lo))
+
           next_opt_state = AdafacMLPLOptState(
               params=next_params,
               mom_rolling=next_mom_rolling,
@@ -707,10 +730,11 @@ class ELO_AdafacMLPLOpt(lopt_base.LearnedOptimizer):
               scheduled_lr=scheduled_lr,
               expert_lr=current_expert_lr)
 
-          return tree_utils.match_type(next_opt_state, opt_state), cosine_loss, magnitude_loss
+          return (tree_utils.match_type(next_opt_state, opt_state),
+                  cosine_loss, magnitude_loss, mse_loss)
         else:
           next_opt_state = AdafacMLPLOptState(
-              params=next_params_lo,
+              params=next_params_expert if parent.expert_only else next_params_lo,
               mom_rolling=next_mom_rolling,
               rms_rolling=next_rms_rolling,
               fac_rolling_features=next_fac_rolling_features,

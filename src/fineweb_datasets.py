@@ -1,4 +1,5 @@
 import os
+import threading
 import numpy as np
 import jax
 import jax.numpy as jnp
@@ -88,6 +89,20 @@ class DataLoaderLite:
         self.tokens = np.load(self.shards[self.current_shard], allow_pickle=True).astype(np.int32)
         self.current_position = self.B * self.T * self.process_rank
 
+    def seek_by_count(self, n):
+        """Fast-forward the loader to the state it would be in after `n` calls to
+        next_batch(). Replays the exact advance/rollover arithmetic of next_batch
+        (so the per-rank (shard, position) matches a continuous run bit-for-bit),
+        but only hits disk on a shard rollover instead of every step."""
+        self.reset()
+        step = self.B * self.T * self.num_processes
+        for _ in range(n):
+            self.current_position += step
+            if self.current_position + (step + 1) > len(self.tokens):
+                self.current_shard = (self.current_shard + 1) % len(self.shards)
+                self.tokens = np.load(self.shards[self.current_shard], allow_pickle=True).astype(np.int32)
+                self.current_position = self.B * self.T * self.process_rank
+
     def __iter__(self):
         return self
 
@@ -109,6 +124,52 @@ class DataLoaderLite:
         y = jax.device_put(jnp.array(y), jax.devices('gpu')[jax.process_index()])
         doc_ids = create_doc_ids_from_padding(x, pad_token_id=self.eos_token_id)
         return {'image': x, 'label': y, 'attention_mask': doc_ids}
+
+class SeekableFinewebIterator:
+    """Thread-safe, lazily-initialized iterator over a DataLoaderLite that also
+    tracks how many batches have been consumed and can seek back to an arbitrary
+    consumed-count. This lets checkpoint/resume restore the exact data position
+    (the fineweb loader is fully deterministic), so a resumed run reads the same
+    train/test batches as a continuous run and the val loss is reproducible.
+
+    Drop-in replacement for ThreadSafeIterator(LazyIterator(generator)) used
+    previously; output batches are identical."""
+
+    def __init__(self, loader_fn, reshape_fn):
+        self._loader_fn = loader_fn
+        self._reshape_fn = reshape_fn
+        self._loader = None
+        self._consumed = 0
+        self._lock = threading.Lock()
+
+    def _ensure_loader(self):
+        if self._loader is None:
+            self._loader = self._loader_fn()
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        with self._lock:
+            self._ensure_loader()
+            batch = self._reshape_fn(self._loader.next_batch())
+            self._consumed += 1
+            return batch
+
+    @property
+    def consumed(self):
+        """Number of batches drawn so far (identical across ranks: all ranks
+        consume in lockstep)."""
+        with self._lock:
+            return self._consumed
+
+    def seek_to(self, n):
+        """Restore the loader to the position after `n` consumed batches."""
+        with self._lock:
+            self._ensure_loader()
+            self._loader.seek_by_count(n)
+            self._consumed = n
+
 
 def make_fineweb_datasets(
     batch_size=[2, 1, 1, 1],
@@ -154,20 +215,21 @@ def make_fineweb_datasets(
     # vocab_size = 50257
 
     def make(split, B, T, batch_shape):
-        def iterator_fn():
-            loader = DataLoaderLite(B, T, process_rank, num_processes, split_map[split], data_root=data_root, eos_token_id=eos_token_id)
-            for batch in loader:
-                # Reshape to batch_shape if provided
-                if batch_shape is not None:
-                    shape = batch_shape_map[split] + (T,)
-                    batch = {
-                        'image': jnp.reshape(batch['image'], shape),
-                        'label': jnp.reshape(batch['label'], shape),
-                        'attention_mask': jnp.reshape(batch['attention_mask'], shape),  # doc_ids: same shape as image
+        def loader_fn():
+            return DataLoaderLite(B, T, process_rank, num_processes, split_map[split], data_root=data_root, eos_token_id=eos_token_id)
 
-                    }
-                yield batch
-        return ThreadSafeIterator(LazyIterator(iterator_fn))
+        def reshape_fn(batch):
+            # Reshape to batch_shape if provided
+            if batch_shape is not None:
+                shape = batch_shape_map[split] + (T,)
+                batch = {
+                    'image': jnp.reshape(batch['image'], shape),
+                    'label': jnp.reshape(batch['label'], shape),
+                    'attention_mask': jnp.reshape(batch['attention_mask'], shape),  # doc_ids: same shape as image
+                }
+            return batch
+
+        return SeekableFinewebIterator(loader_fn, reshape_fn)
 
     # Determine batch_shape for each split
     def get_batch_shape(bs):

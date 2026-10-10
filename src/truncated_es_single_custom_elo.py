@@ -376,7 +376,7 @@ class ESSingle_ELO(ESSingle):
        for the buffer-push decision.
     3. Run truncation windows via `common.maybe_stacked_es_unroll`, with the
        **same** `vec_pos` across all windows of the inner problem.
-    4. `_push_buffers_jit` pushes the post-truncation state into the resume
+    4. `_push_buffers_jit` pushes the pre-truncation snapshot into the resume
        buffer when struggle or any_done fires.
     5. Call `self.grad_fn` (single-device or sharded) to compute the ES-Single
        ELO gradient with the dir/mag/task blend.
@@ -584,15 +584,17 @@ class ESSingle_ELO(ESSingle):
       n_bc_grads_list.append(n_bc_grads)
 
     # 4) Post-truncation buffer push (same logic as PES_ELO; buffer is
-    # estimator-agnostic so we reuse the helper directly).
+    # estimator-agnostic so we reuse the helper directly). Pushes the
+    # pre-window snapshot when a new loss low occurred inside this window;
+    # the write slot advances only when the trajectory ends (any_done).
     buffer_size = jax.tree_util.tree_leaves(p_state.state_buffer)[0].shape[1]
-    pos_is_done_stack = jnp.concatenate([y.is_done for y in p_yses], axis=0)
-    neg_is_done_stack = jnp.concatenate([y.is_done for y in n_yses], axis=0)
+    any_done = (jnp.any(jnp.stack([y.is_done for y in p_yses]), axis=(0, 1))
+                | jnp.any(jnp.stack([y.is_done for y in n_yses]), axis=(0, 1)))
     p_state, n_state = _push_buffers_jit(
         p_state, n_state,
         snap_pos_opt, snap_pos_tp, snap_neg_opt, snap_neg_tp,
         snap_mean_max_cumsum,
-        pos_is_done_stack, neg_is_done_stack,
+        any_done,
         buffer_size)
 
     if self.use_bc_grads:

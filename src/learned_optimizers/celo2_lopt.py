@@ -8,18 +8,115 @@ from typing import Optional
 import os
 import pickle
 
+import chex
 import flax
 import gin
 import jax
+from jax import lax
 import jax.numpy as jnp
 from learned_optimization.learned_optimizers import base as lopt_base
+from learned_optimization.learned_optimizers import common
 from learned_optimization.optimizers import base as opt_base
 from learned_optimization import tree_utils
 import optax
 
-from .celo2_optax import Celo2Transformation, load_checkpoint, scale_by_celo2
+from .celo2_optax import (
+    Celo2Transformation,
+    load_checkpoint,
+    scale_by_celo2,
+    vec_bias_correction,
+)
 
 PRNGKey = jnp.ndarray
+
+
+@flax.struct.dataclass
+class AdamState:
+    """Optax state for Adam."""
+    rms_rolling: chex.ArrayTree
+    mom_rolling: chex.ArrayTree
+    iteration: jnp.ndarray
+
+
+class AdamTransformation:
+    """Adam optimizer optax transformation.
+
+    Ported verbatim from the official celo repo (celo/optimizers/celo2.py).
+    bias_correction=False: step = m * rsqrt(v + eps) (eps inside the sqrt).
+    bias_correction=True: bias-correct m and v first, same step formula.
+    """
+
+    def __init__(self, b1=0.9, b2=0.999, epsilon=1e-8, bias_correction=True):
+        self.b1 = b1
+        self.b2 = b2
+        self.epsilon = epsilon
+        self.bias_correction = bias_correction
+
+    def accumulators_for_decays(self):
+        mom_decay = jnp.asarray((self.b1,))
+        rms_decay = jnp.asarray((self.b2,))
+        return common.vec_rolling_mom(mom_decay), common.vec_rolling_rms(rms_decay)
+
+    def _compute_step(self, m, rms):
+        rsqrt = lax.rsqrt(rms + self.epsilon)
+        norm_g = m * rsqrt
+        return norm_g[..., 0]
+
+    # def _compute_step(self, m, rms):
+    #     denom = jnp.sqrt(rms) + self.epsilon
+    #     norm_g = m / denom
+    #     return norm_g[..., 0]
+
+    def init(self, params: chex.ArrayTree) -> AdamState:
+        mom_roll, rms_roll = self.accumulators_for_decays()
+        return AdamState(
+            rms_rolling=rms_roll.init(params),
+            mom_rolling=mom_roll.init(params),
+            iteration=jnp.asarray(0, dtype=jnp.int32),
+        )
+
+    def update(self, grads, state: AdamState, params=None) -> tuple:
+        """Returns (step, new_state). Step is the raw Adam update direction."""
+        iteration = optax.safe_increment(state.iteration)
+        mom_roll, rms_roll = self.accumulators_for_decays()
+        next_mom_rolling = mom_roll.update(state.mom_rolling, grads)
+        next_rms_rolling = rms_roll.update(state.rms_rolling, grads)
+
+        if self.bias_correction:
+            m = vec_bias_correction(next_mom_rolling.m, (self.b1,), iteration)
+            rms = vec_bias_correction(next_rms_rolling.rms, (self.b2,), iteration)
+        else:
+            m = next_mom_rolling.m
+            rms = next_rms_rolling.rms
+
+        step = jax.tree_util.tree_map(self._compute_step, m, rms)
+
+        new_state = AdamState(
+            mom_rolling=next_mom_rolling,
+            rms_rolling=next_rms_rolling,
+            iteration=iteration,
+        )
+        return step, new_state
+
+
+def scale_by_adam(
+    b1: float = 0.9,
+    b2: float = 0.999,
+    epsilon: float = 1e-8,
+    bias_correction: bool = True,
+) -> optax.GradientTransformation:
+    """Create an optax GradientTransformation for the official celo Adam."""
+    transformation = AdamTransformation(
+        b1=b1, b2=b2, epsilon=epsilon, bias_correction=bias_correction,
+    )
+
+    def init_fn(params):
+        return transformation.init(params)
+
+    def update_fn(updates, state, params=None, **kwargs):
+        return transformation.update(updates, state, params)
+
+    return optax.GradientTransformation(init_fn, update_fn)
 
 
 @flax.struct.dataclass
@@ -54,6 +151,8 @@ class Celo2LOpt(lopt_base.LearnedOptimizer):
         adam_lr_mult=1.0,
         adam_beta1=0.9,
         adam_beta2=0.95,
+        adam_epsilon=1e-8,
+        adam_bias_correction=True,
         adam_weight_decay=None,
         use_adamw_for_1d=True,
         # Celo2 model config (forwarded to scale_by_celo2)
@@ -73,6 +172,8 @@ class Celo2LOpt(lopt_base.LearnedOptimizer):
         self.adam_lr_mult = adam_lr_mult
         self.adam_beta1 = adam_beta1
         self.adam_beta2 = adam_beta2
+        self.adam_epsilon = adam_epsilon
+        self.adam_bias_correction = adam_bias_correction
         self.adam_weight_decay = adam_weight_decay if adam_weight_decay is not None else weight_decay
         self.use_adamw_for_1d = use_adamw_for_1d
         self.orthogonalize = orthogonalize
@@ -174,11 +275,15 @@ class Celo2LOpt(lopt_base.LearnedOptimizer):
 
                 if parent.use_adamw_for_1d:
                     scaled_lr_schedule = lambda step: parent.adam_lr_mult * self._lr_schedule(step)
-                    adam_opt = optax.adamw(
-                        scaled_lr_schedule,
-                        b1=parent.adam_beta1,
-                        b2=parent.adam_beta2,
-                        weight_decay=parent.adam_weight_decay,
+                    adam_opt = optax.chain(
+                        scale_by_adam(
+                            b1=parent.adam_beta1,
+                            b2=parent.adam_beta2,
+                            epsilon=parent.adam_epsilon,
+                            bias_correction=parent.adam_bias_correction,
+                        ),
+                        optax.add_decayed_weights(parent.adam_weight_decay),
+                        optax.scale_by_learning_rate(scaled_lr_schedule),
                     )
 
                     param_labels = jax.tree.map_with_path(

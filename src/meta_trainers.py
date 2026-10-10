@@ -438,19 +438,19 @@ def gradient_worker_compute_distributed(
       #assumes that there will only be one task per process when using distributed
 
       if jax.process_count() == 1 or pmap_across_devices:
-        print(
-            f"[PARALLEL|RANK {jax.process_index()}] gradient_worker_compute_distributed: "
-            f"{'pmap_across_devices=True — gradient already globally consistent from PES all-gather; skipping cross-process grad all-reduce.' if pmap_across_devices else 'Single process — no cross-process communication needed.'} "
-            f"local loss={[float(l) for l in losses]}"
-        )
+        # print(
+        #     f"[PARALLEL|RANK {jax.process_index()}] gradient_worker_compute_distributed: "
+        #     f"{'pmap_across_devices=True — gradient already globally consistent from PES all-gather; skipping cross-process grad all-reduce.' if pmap_across_devices else 'Single process — no cross-process communication needed.'} "
+        #     f"local loss={[float(l) for l in losses]}"
+        # )
         grads_accum = tree_utils.tree_div(grads_accum, len(gradient_estimators))
         mean_loss = jnp.mean(jnp.asarray(losses))
       else:
-        print(
-            f"[PARALLEL|RANK {jax.process_index()}] gradient_worker_compute_distributed: "
-            f"pmap_across_devices=False — performing pmap all-reduce of gradients "
-            f"across {jax.process_count()} processes (global_task_size={global_task_size})."
-        )
+        # print(
+        #     f"[PARALLEL|RANK {jax.process_index()}] gradient_worker_compute_distributed: "
+        #     f"pmap_across_devices=False — performing pmap all-reduce of gradients "
+        #     f"across {jax.process_count()} processes (global_task_size={global_task_size})."
+        # )
         grads_accum = jax.tree_util.tree_map(lambda x: jnp.expand_dims(x,axis=0),grads_accum)
         # print("grads_accum shape",grads_accum.shape)
         grads_accum = jax.tree_util.tree_map(lambda x: jax.pmap(reduce_across_devices, axis_name='i')(x), grads_accum)
@@ -637,7 +637,7 @@ def default_meta_trainer(args):
             )
 
         baseline_losses = baseline_losses_dict.get(task_name, None)
-        if args.gradient_estimator_args['kwargs']['use_baseline_losses']:
+        if args.gradient_estimator_args['kwargs'].get('use_baseline_losses', False):
             assert baseline_losses is not None, f"Baseline trajectory for task {task_name} not found"
 
         inner_length_schedule = build_inner_length_schedule(args)
@@ -653,8 +653,8 @@ def default_meta_trainer(args):
         theta_opt=meta_opt,
         device=jax.devices()[jax.process_index()],
         global_task_size=args.global_task_size,
-        pmap_across_devices=args.gradient_estimator_args['kwargs']['pmap_across_devices'],
-        bc_grad_weight=args.gradient_estimator_args['kwargs']['bc_grad_weight'],
+        pmap_across_devices=args.gradient_estimator_args['kwargs'].get('pmap_across_devices', False),
+        bc_grad_weight=args.gradient_estimator_args['kwargs'].get('bc_grad_weight', None),
     )
 
 
