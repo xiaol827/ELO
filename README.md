@@ -8,14 +8,14 @@
 
 </div>
 
-**ELO** is an efficient long-horizon meta-learning framework for learned optimization. With only <7 hours of meta-training on a single GPU, ELO enables learned optimizers to transfer from small-scale tasks to practical vision and language pretraining, outperform well-tuned AdamW across multiple tasks, and achieve competitive results with Muon on GPT-2 124M/350M pretraining.
+**ELO** is an efficient long-horizon meta-learning framework for learned optimization. With less than 7 H100 GPU-hours of meta-training, ELO enables learned optimizers to transfer from small-scale tasks to practical vision (ViT-B/16, ResNet-50 on ImageNet-1K) and language (GPT-2 and GPT-3 on FineWeb) pretraining, outperform well-tuned AdamW across all evaluated tasks, and outperform both AdamW and Muon on GPT-2 (30M and 124M) pretraining.
 
 ## Key Features
 
 - **Failure-aware resume buffer** — reallocates redundant meta-training compute toward longer failure regimes, scaling learned-optimizer meta-training to long inner problems
 - **Progressive teacher forcing** — enforces decoupled progressive expert supervision, providing stable meta-learning signals that additionally lead to generalizable LOs
-- **Outperforms hand-designed optimizers** — ELO-Celo2 outperforms well-tuned AdamW across all benchmarks and remains competitive with Muon on language modeling.
-- **Cheap to meta-train** — every ELO-LO is trained in under 7 GPU-hours
+- **Outperforms hand-designed optimizers** — ELO-Celo2 outperforms well-tuned AdamW across all benchmarks, and outperforms both AdamW and Muon on GPT-2 (30M and 124M) pretraining.
+- **Cheap to meta-train** — every ELO-LO is meta-trained in under 7 H100 GPU-hours
 
 <div align="center">
   <img src="assets/elo_overview.png" width="95%" alt="ELO overview. Left: the failure-aware resume buffer pushes hard points and resumes inner problems from them, shifting meta-training compute from the early easy range to the late hard range under an identical compute budget. Right: progressive expert supervision blends expert and learned-optimizer trajectories with a weight that grows over meta-training, replacing high-variance meta-gradients from long unrolls with a stable imitation + exploitation signal.">
@@ -149,17 +149,17 @@ cd big_vision/ && python -m big_vision.tools.download_tfds_datasets imagenet2012
 
 ## Usage (E.g. ELO-Celo2)
 
-We meta-train on a single L40S GPU (~6.5h) and evaluate on 4 H100 by default.
+We meta-train on a single GPU (~6.5h on H100; L40S gives nearly the same wall-clock time) and evaluate on 4 H100 by default.
 
 ### Meta-training
 ```
 OMP_NUM_THREADS=16 CUDA_VISIBLE_DEVICES=0 python src/main.py \
 --config config/meta_train/meta_train_base.py,\
 config/learned_optimizer/elo_celo2.py,\
-config/inner_length_schedule/constant_100_2000.py,\
+config/inner_length_schedule/constant_2000.py,\
 config/gradient_estimators/pes_elo.py,\
 config/truncated_step/lopt_elo.py,\
-config/data/no_aug.py,\
+config/data/light_aug.py,\
 config/schedule/warmup_cosine_decay.py,\
 config/optimizer/adamw.py,\
 config/gradient_transform/before/clip_by_global_norm.py,\
@@ -173,28 +173,30 @@ learned_optimizer_args.kwargs.end_lr=0.001 \
 learned_optimizer_args.kwargs.warmup_fraction=0.0 \
 learned_optimizer_args.kwargs.adam_lr_mult=20 \
 learned_optimizer_args.kwargs.weight_decay=0.0 \
-learned_optimizer_args.kwargs.expert_lr_max=0.01 \
-learned_optimizer_args.kwargs.expert_lr_min=0.0001 \
+learned_optimizer_args.kwargs.expert_lr_max=3.16e-3 \
+learned_optimizer_args.kwargs.expert_lr_min=3.16e-3 \
 learned_optimizer_args.kwargs.muon_expert_adamlr_scaler=0.3 \
 learned_optimizer_args.kwargs.expert_optim=muon \
+learned_optimizer_args.kwargs.adam_bias_correction=True \
+learned_optimizer_args.kwargs.bias_correction=True \
 learned_optimizer_args.kwargs.clip_grad=True \
 learned_optimizer_args.kwargs.clip_norm=1.0 \
 schedule.kwargs.peak_value=1e-4 \
 schedule.kwargs.end_value=1e-5 \
-schedule.kwargs.decay_steps=99900 \
-schedule.kwargs.warmup_steps=100 \
+schedule.kwargs.decay_steps=95000 \
+schedule.kwargs.warmup_steps=5000 \
 inner_problem_length_schedule.sample_choice=uniform \
 gradient_estimator_args.kwargs.steps_per_jit=10 \
 gradient_estimator_args.kwargs.truncation_length=50 \
-gradient_estimator_args.kwargs.expert_wd_sp=5000 \
-gradient_estimator_args.kwargs.expert_wd_ep=50000 \
+gradient_estimator_args.kwargs.expert_wd_sp=7000 \
+gradient_estimator_args.kwargs.expert_wd_ep=70000 \
 gradient_estimator_args.kwargs.expert_traj_wmin=0.0 \
 gradient_estimator_args.kwargs.expert_dirloss_weight=0.7 \
 gradient_estimator_args.kwargs.expert_magloss_weight=0.3 \
 gradient_estimator_args.kwargs.expert_dirloss_wmin=0.3 \
 gradient_estimator_args.kwargs.expert_magloss_wmin=0.0 \
-truncated_step_args.kwargs.buffer_cfg.thred=0.2 \
-truncated_step_args.kwargs.buffer_cfg.min_thred=0.2 \
+truncated_step_args.kwargs.buffer_cfg.thred=0.5 \
+truncated_step_args.kwargs.buffer_cfg.min_thred=0.5 \
 truncated_step_args.kwargs.buffer_cfg.buffer_size=1 \
 --num_tasks 8 \
 --num_outer_steps 100000 \
@@ -209,7 +211,7 @@ truncated_step_args.kwargs.buffer_cfg.buffer_size=1 \
 --auto_resume \
 --image_dtype float32
 ```
-This will automatically log training metrics and the learned optimizer weights to a W&B run. Be sure to record the **wandb_checkpoint_id** and use it to fill in the **[NEED]** below.
+This will automatically log training metrics and the learned optimizer weights to a W&B run. Be sure to record the **wandb_checkpoint_id** and use it to fill in the **[NEED]** below. For language modeling we average ("soup") the last checkpoints of the run with `--checkpoint_soup_range 97500 100000`.
 
 --------
 ### Image classification (ViT-Base/16, ImageNet-1K)
@@ -222,10 +224,14 @@ python3 -m big_vision.train_lo \
 --config.model.dtype_mm bfloat16 \
 --config.input.batch_size 2048 \
 --config.lr 3.16e-5 \
---config.wd 0.001 \
+--config.wd 0.0001 \
 --config.schedule.min_lr_factor 0.01 \
---config.lo_kwargs.init_lr=0.0 \
+--config.lo_kwargs.init_lr=3.16e-5 \
+--config.lo_kwargs.warmup_fraction=0 \
+--config.lo_kwargs.initial_rms_decays='(0.95,)' \
 --config.lo_kwargs.adam_lr_mult=20 \
+--config.lo_kwargs.adam_bias_correction=True \
+--config.lo_kwargs.bias_correction=True \
 --config.lo_kwargs.clip_grad=True \
 --config.lo_kwargs.clip_norm=1.0 \
 --config.lo_kwargs.meta_train=False \
@@ -242,6 +248,8 @@ config/gradient_transform/before/clip_by_global_norm.py,\
 config/gradient_transform/after/none.py \
 --cfg_options \
 learned_optimizer_args.kwargs.meta_train=False \
+learned_optimizer_args.kwargs.adam_bias_correction=True \
+learned_optimizer_args.kwargs.bias_correction=True \
 learned_optimizer_args.kwargs.init_lr=0.0 \
 learned_optimizer_args.kwargs.peak_lr=3.16e-4 \
 learned_optimizer_args.kwargs.end_lr=3.16e-5 \
@@ -265,6 +273,7 @@ learned_optimizer_args.kwargs.warmup_fraction=0.05 \
 --needs_state \
 --task "transformer-dense-w768-d12-h12_fineweb-s1024-gpt2" \
 --wandb_checkpoint_id [NEED] \
+--checkpoint_soup_range 97500 100000 \
 --save_iter 500'
 ```
 

@@ -76,6 +76,9 @@ def get_config(arg=None):
       weight_decay=0.0,
       adam_lr_mult=1.0,
       adam_weight_decay=None,
+      # meta-test recipe: bias-correct the 1D Adam moments and the MLP features
+      adam_bias_correction=True,
+      bias_correction=True,
       use_adamw_for_1d=True,
       clip_grad=False,
       clip_norm=1.0,

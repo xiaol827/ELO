@@ -622,7 +622,9 @@ def default_meta_trainer(args):
     meta_opt = build_meta_optimizer(args)
 
 
-    baseline_losses_dict = load_trajectories()
+    # baselines.pickle is only needed (and only shipped) for use_baseline_losses
+    use_baseline_losses = args.gradient_estimator_args['kwargs'].get('use_baseline_losses', False)
+    baseline_losses_dict = load_trajectories() if use_baseline_losses else {}
     print("args.inner_problem_length_schedule", args.inner_problem_length_schedule)
 
     # build per-task gradient estimators
@@ -637,7 +639,7 @@ def default_meta_trainer(args):
             )
 
         baseline_losses = baseline_losses_dict.get(task_name, None)
-        if args.gradient_estimator_args['kwargs'].get('use_baseline_losses', False):
+        if use_baseline_losses:
             assert baseline_losses is not None, f"Baseline trajectory for task {task_name} not found"
 
         inner_length_schedule = build_inner_length_schedule(args)
