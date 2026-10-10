@@ -12,10 +12,10 @@
 
 ## Key Features
 
-- **Failure-aware resume buffer** — reallocates redundant meta-training compute toward longer failure regimes, scaling learned-optimizer meta-training to long inner problems
-- **Progressive teacher forcing** — enforces decoupled progressive expert supervision, providing stable meta-learning signals that additionally lead to generalizable LOs
-- **Outperforms hand-designed optimizers** — ELO-Celo2 outperforms well-tuned AdamW across all benchmarks, and outperforms both AdamW and Muon on GPT-2 (30M and 124M) pretraining.
-- **Cheap to meta-train** — every ELO-LO is meta-trained in under 7 H100 GPU-hours
+- **Resume buffer** — reallocates redundant meta-training compute toward longer failure regimes, scaling learned-optimizer meta-training to long inner problems.
+- **Progressive expert supervision** — enforces decoupled progressive expert supervision, providing stable meta-learning signals that additionally lead to generalizable LOs.
+- **Consistent downstream gains** — ELO-LOs substantially outperform their base LOs.
+- **Cheap to meta-train** — every ELO-LO is trained in under 7 GPU-hours.
 
 <div align="center">
   <img src="assets/elo_overview.png" width="95%" alt="ELO overview. Left: the failure-aware resume buffer pushes hard points and resumes inner problems from them, shifting meta-training compute from the early easy range to the late hard range under an identical compute budget. Right: progressive expert supervision blends expert and learned-optimizer trajectories with a weight that grows over meta-training, replacing high-variance meta-gradients from long unrolls with a stable imitation + exploitation signal.">
