@@ -31,7 +31,7 @@ import ml_collections as mlc
 MIXUP_DEF = {
     'none': dict(p=0.0, fold_in=None),
     'light1': dict(p=0.0, fold_in=None),
-    'light2': dict(p=0.2, fold_in=None),
+    'light2': dict(p=0.0, fold_in=None),
     'medium1': dict(p=0.2, fold_in=None),
     'medium2': dict(p=0.5, fold_in=None),
     'strong1': dict(p=0.5, fold_in=None),
@@ -120,7 +120,7 @@ def get_config(arg=None):
   # Optimizer section
   # config.optax_name = 'big_vision.momentum_hp'
   config.optax_name = 'scale_by_adam'
-  config.optax = dict(mu_dtype='bfloat16')
+  config.optax = dict(mu_dtype='bfloat16', b2=0.999)  # b2 exposed for CLI override (optax default)
   config.grad_clip_norm = 1.0
 
   config.wd = 1e-4

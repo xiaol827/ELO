@@ -43,7 +43,7 @@ import ml_collections as mlc
 MIXUP_DEF = {
     'none': dict(p=0.0, fold_in=None),
     'light1': dict(p=0.0, fold_in=None),
-    'light2': dict(p=0.2, fold_in=None),
+    'light2': dict(p=0.0, fold_in=None),
     'medium1': dict(p=0.2, fold_in=None),
     'medium2': dict(p=0.5, fold_in=None),
     'strong1': dict(p=0.5, fold_in=None),
@@ -149,7 +149,7 @@ def get_config(arg=None):
   # Optimizer section
   config.grad_clip_norm = 1.0
   config.optax_name = 'scale_by_adam'
-  config.optax = dict(mu_dtype='bfloat16')
+  config.optax = dict(mu_dtype='bfloat16', b2=0.999)  # b2 exposed for CLI override (optax default)
   # The modified AdaFactor we introduced in https://arxiv.org/abs/2106.04560
   # almost always behaves exactly like adam, but at a fraction of the memory
   # cost (specifically, adam_bf16 = +1.5M, adafactor = +0.5M), hence it is a

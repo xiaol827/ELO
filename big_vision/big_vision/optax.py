@@ -15,23 +15,52 @@
 """Gradient transformations and other optax utilities."""
 
 import operator
+import os
 import big_vision.utils as u
 import jax
 import jax.numpy as jnp
+import numpy as onp
 import optax
 import learned_optimizers as _learned_optimizers
-from helpers import download_wandb_checkpoint
+from helpers import build_checkpoint_soup, download_wandb_checkpoint
 import pickle
 
 
 def bv_build_learned_optimizer(config):
+  if config.lo_name == "Muon":
+    # Muon is a hand-designed optimizer defined locally in big_vision, not in
+    # the shared learned_optimizers package.
+    from big_vision.muon_lopt import MuonLOpt
+    return MuonLOpt(**dict(config.get("lo_kwargs", {})))
   cls = getattr(_learned_optimizers, config.lo_name)
   return cls(**dict(config.get("lo_kwargs", {})))
 
 
 def build_lopt(config):
-  lo_checkpoint = download_wandb_checkpoint(config)
   opt = bv_build_learned_optimizer(config)
+  # Hand-designed optimizers (e.g. Muon) have no meta-trained checkpoint.
+  # Skip the wandb download and hand back a dummy theta that opt_fn ignores.
+  if not config.get("lo_needs_checkpoint", True):
+    # Host (numpy) array, like a pickle-loaded checkpoint: build_lopt runs under
+    # train_lo's global jax_transfer_guard="disallow", so a device array here
+    # (jnp.zeros) would trip the guard. u.reshard moves it to device later.
+    return opt, {"_unused": onp.zeros((1,), onp.float32)}
+  # Local checkpoint (e.g. the official Celo2 theta.state), mirroring the LM
+  # meta-test path: no wandb id -> lopt.load_meta_params(checkpoint_path).
+  local_path = config.get("lo_kwargs", {}).get("checkpoint_path")
+  if not config.get("wandb_checkpoint_id") and local_path:
+    assert os.path.isfile(local_path), f"checkpoint_path not found: {local_path}"
+    # Loading builds a reference tree on device; allow that here and hand back
+    # host arrays like the pickle path does (u.reshard moves them later).
+    with jax.transfer_guard("allow"):
+      meta_params = jax.device_get(opt.load_meta_params(local_path))
+    return opt, meta_params
+  if config.get("checkpoint_soup_range"):
+    # Element-wise average of the wandb checkpoints in [start, end], as in the
+    # LM meta-test's --checkpoint_soup_range.
+    lo_checkpoint = build_checkpoint_soup(config)
+  else:
+    lo_checkpoint = download_wandb_checkpoint(config)
   with open(lo_checkpoint, "rb") as f:
       meta_params = pickle.load(f)
   # Return the unbound LearnedOptimizer alongside theta so the caller can

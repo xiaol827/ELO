@@ -31,7 +31,7 @@ import ml_collections as mlc
 MIXUP_DEF = {
     'none': dict(p=0.0, fold_in=None),
     'light1': dict(p=0.0, fold_in=None),
-    'light2': dict(p=0.2, fold_in=None),
+    'light2': dict(p=0.0, fold_in=None),
     'medium1': dict(p=0.2, fold_in=None),
     'medium2': dict(p=0.5, fold_in=None),
     'strong1': dict(p=0.5, fold_in=None),
@@ -70,6 +70,7 @@ def get_config(arg=None):
   config.lo_name = 'ELO_AdafacMLPLOpt'
   config.selected_checkpoint = ''
   config.wandb_checkpoint_id = 'hirox827-soon/meta-training-comparison/2kh3rb3k'
+  config.checkpoint_soup_range = ()  # e.g. (97500, 100000): average wandb ckpts in range
   config.lo_kwargs = dict(
       exp_mult=0.001,
       step_mult=0.001,

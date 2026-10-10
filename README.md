@@ -211,7 +211,7 @@ truncated_step_args.kwargs.buffer_cfg.buffer_size=1 \
 --auto_resume \
 --image_dtype float32
 ```
-This will automatically log training metrics and the learned optimizer weights to a W&B run. Be sure to record the **wandb_checkpoint_id** and use it to fill in the **[NEED]** below. For language modeling we average ("soup") the last checkpoints of the run with `--checkpoint_soup_range 97500 100000`.
+This will automatically log training metrics and the learned optimizer weights to a W&B run. Be sure to record the **wandb_checkpoint_id** and use it to fill in the **[NEED]** below. For meta-testing we average ("soup") the last checkpoints of the run (steps 97500–100000) via `checkpoint_soup_range`.
 
 --------
 ### Image classification (ViT-Base/16, ImageNet-1K)
@@ -220,6 +220,7 @@ python3 -m big_vision.train_lo \
 --config big_vision/configs/vit_i1k_elo_celo2.py:variant=B/16,aug=strong8 \
 --config.wandb.name elo_celo2_in1k_vitb16_lr3.16e_5_strong8 \
 --config.wandb_checkpoint_id [NEED] \
+--config.checkpoint_soup_range='(97500,100000)' \
 --config.total_steps 50000 \
 --config.model.dtype_mm bfloat16 \
 --config.input.batch_size 2048 \

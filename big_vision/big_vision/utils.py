@@ -1163,8 +1163,11 @@ def mixup(rng, *things, p, **more_things):
 
 def sync():
   """Syncs hosts and empties async computation queue."""
+  # PositionalSharding was removed in JAX 0.9; a 1D NamedSharding over all
+  # devices places one element per device, exactly like the old version.
+  mesh = jax.sharding.Mesh(jax.devices(), ("devices",))
   x = reshard(np.ones(jax.device_count()),
-              jax.sharding.PositionalSharding(jax.devices()))
+              jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec("devices")))
   jax.jit(jnp.sum)(x).block_until_ready()
 
 

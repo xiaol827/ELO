@@ -22,7 +22,7 @@ import ml_collections as mlc
 MIXUP_DEF = {
     'none': dict(p=0.0, fold_in=None),
     'light1': dict(p=0.0, fold_in=None),
-    'light2': dict(p=0.2, fold_in=None),
+    'light2': dict(p=0.0, fold_in=None),
     'medium1': dict(p=0.2, fold_in=None),
     'medium2': dict(p=0.5, fold_in=None),
     'strong1': dict(p=0.5, fold_in=None),
@@ -61,6 +61,7 @@ def get_config(arg=None):
   config.lo_name = 'ELO_Celo2LOpt'
   config.selected_checkpoint = ''
   config.wandb_checkpoint_id = 'FILL_ELO_CELO2_WANDB_ID'
+  config.checkpoint_soup_range = ()  # e.g. (97500, 100000): average wandb ckpts in range
   config.lo_kwargs = dict(
       orthogonalize=True,
       ff_hidden_size=8,
@@ -75,18 +76,23 @@ def get_config(arg=None):
       end_lr=1e-5,
       weight_decay=0.0,
       adam_lr_mult=1.0,
+      adam_bias_correction=False,
       adam_weight_decay=None,
-      # meta-test recipe: bias-correct the 1D Adam moments and the MLP features
-      adam_bias_correction=True,
-      bias_correction=True,
       use_adamw_for_1d=True,
       clip_grad=False,
       clip_norm=1.0,
+      clip_value=1000.0,
       expert_lr_max=0.001,
       expert_lr_min=1e-5,
       expert_lr_decay_steps=10000,
       expert_weight_decay=0.0,
       expert_optim="adamw",
+      muon_expert_adamlr_scaler=0.3,
+      exp_sgdm_mom_idx=0,
+      exp_adam_mom_idx=0,
+      exp_muon_mom_idx=1,
+      exp_adam_rms_idx=-1,
+      bias_correction=False,  # forwarded to Celo2Transformation
       meta_train=False,
   )
 

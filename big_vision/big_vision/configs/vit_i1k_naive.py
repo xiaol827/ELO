@@ -43,7 +43,7 @@ import ml_collections as mlc
 MIXUP_DEF = {
     'none': dict(p=0.0, fold_in=None),
     'light1': dict(p=0.0, fold_in=None),
-    'light2': dict(p=0.2, fold_in=None),
+    'light2': dict(p=0.0, fold_in=None),
     'medium1': dict(p=0.2, fold_in=None),
     'medium2': dict(p=0.5, fold_in=None),
     'strong1': dict(p=0.5, fold_in=None),
