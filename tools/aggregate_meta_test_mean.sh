@@ -1,6 +1,6 @@
 #!/bin/bash
 # Aggregate per-ckpt 4-task meta-test runs into 9 'mean over tasks' summary runs
-# under group='summary' in <NEED>/xiao-meta-testing-lossweight-sweep.
+# under group='summary' in <NEED>/<NEED>.
 #
 # Usage:
 #   bash tools/aggregate_meta_test_mean.sh                # normal run

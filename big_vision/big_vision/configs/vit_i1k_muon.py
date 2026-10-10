@@ -87,8 +87,8 @@ def get_config(arg=None):
 
   config.wandb = dict(
       enabled=True,
-      project='xiao_big_vision',
-      entity='eb-lab',
+      project='<NEED>',
+      entity='<NEED>',
       name='muon_vitb16_lr1e-3',
       tags=[],
       notes='',

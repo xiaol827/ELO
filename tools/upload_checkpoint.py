@@ -48,11 +48,11 @@ if __name__ == "__main__":
 python tools/upload_checkpoint.py \
 --project mup-meta-training \
 --run_id l01dw6n0 \
---checkpoint_path /btherien/github/new_install/learned_aggregation/checkpoints/l01dw6n0MuRNNMLPLOpt32_multi-task-withmumlp-w1024-d3_imagenet-32x32x3_K8_H4_0.5_mup_RNN_distributed/global_step5000.pickle
+--checkpoint_path <PATH_TO_CHECKPOINT>/global_step5000.pickle
 
 python tools/upload_checkpoint.py \
 --project mup-meta-training \
 --run_id hso8fj12 \
---checkpoint_path /btherien/github/new_install/learned_aggregation/checkpoints/hso8fj12RNNMLPLOpt32_multi-task-withmlp-w1024-d3_imagenet-32x32x3_K8_H4_0.5_sp_RNN_distributed/global_step5000.pickle
+--checkpoint_path <PATH_TO_CHECKPOINT>/global_step5000.pickle
 
 """

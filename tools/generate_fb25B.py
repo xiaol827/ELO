@@ -95,7 +95,7 @@ def transform_learned_opt(src_path, tgt_path):
     text = text.replace('config/data/light_aug.py', 'config/data/no_aug.py')
 
     # 2. test_project
-    text = re.sub(r'--test_project\s+\S+', '--test_project xiao-meta-testing-fb2.5B', text)
+    text = re.sub(r'--test_project\s+\S+', '--test_project <NEED>', text)
 
     # 3. name_suffix
     old_suf = extract_suffix(text)
@@ -161,7 +161,7 @@ config/gradient_transform/after/none.py,\\
 {sweep_cfg} \\
 --cfg_options \\
 {cfg_options}
---test_project xiao-meta-testing-fb2.5B \\
+--test_project <NEED> \\
 --master_port $MASTER_PORT \\
 --master_node {master_var} \\
 --num_runs 1 \\
@@ -236,7 +236,7 @@ config/gradient_transform/before/clip_by_global_norm.py,\\
 config/gradient_transform/after/none.py \\
 --cfg_options \\
 {cfg_options}
---test_project xiao-meta-testing-fb2.5B \\
+--test_project <NEED> \\
 --master_port $MASTER_PORT \\
 --master_node {master_var} \\
 --num_runs 1 \\
@@ -295,7 +295,7 @@ def transform_adamw_muon_nonsweep_8b(src_path, tgt_path, opt_type):
     text = text.replace('config/data/light_aug.py', 'config/data/no_aug.py')
 
     # 2. test_project
-    text = re.sub(r'--test_project\s+\S+', '--test_project xiao-meta-testing-fb2.5B', text)
+    text = re.sub(r'--test_project\s+\S+', '--test_project <NEED>', text)
 
     # 3. name_suffix
     old_suf = extract_suffix(text)

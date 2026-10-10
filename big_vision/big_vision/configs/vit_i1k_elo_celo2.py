@@ -98,8 +98,8 @@ def get_config(arg=None):
 
   config.wandb = dict(
       enabled=True,
-      project='xiao_big_vision',
-      entity='eb-lab',
+      project='<NEED>',
+      entity='<NEED>',
       name='elo_celo2_vitb16',
       tags=[],
       notes='',

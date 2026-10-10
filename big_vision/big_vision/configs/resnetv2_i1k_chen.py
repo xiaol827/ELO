@@ -69,7 +69,7 @@ def get_config(arg=None):
 
   config.lo_name = 'ChenAdafacMLPLOpt'
   config.selected_checkpoint = ''
-  config.wandb_checkpoint_id = 'hirox827-soon/meta-training-comparison/zir0ide0'
+  config.wandb_checkpoint_id = 'FILL_CHEN_WANDB_ID'
   config.lo_kwargs = dict(
       exp_mult=0.001,
       step_mult=0.001,
@@ -97,8 +97,8 @@ def get_config(arg=None):
 
   config.wandb = dict(
       enabled=True,
-      project='xiao_big_vision',
-      entity='eb-lab',  # Set to your wandb username/team, or None for default
+      project='<NEED>',
+      entity='<NEED>',  # Set to your wandb username/team, or None for default
       name='chen_v2resnet50_lr1e-3',  # Run name, auto-generated if None
       tags=[],  # List of tags for the run
       notes='',  # Notes for the run

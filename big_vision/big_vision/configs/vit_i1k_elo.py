@@ -80,7 +80,7 @@ def get_config(arg=None):
 
   config.lo_name = 'ELO_AdafacMLPLOpt'
   config.selected_checkpoint = ''
-  config.wandb_checkpoint_id = 'hirox827-soon/meta-training-comparison/2kh3rb3k'
+  config.wandb_checkpoint_id = 'FILL_ELO_WANDB_ID'
   config.checkpoint_soup_range = ()  # e.g. (97500, 100000): average wandb ckpts in range
   config.lo_kwargs = dict(
       exp_mult=0.001,
@@ -110,8 +110,8 @@ def get_config(arg=None):
 
   config.wandb = dict(
       enabled=True,
-      project='xiao_big_vision',
-      entity='eb-lab',  # Set to your wandb username/team, or None for default
+      project='<NEED>',
+      entity='<NEED>',  # Set to your wandb username/team, or None for default
       name='elo_vitb16',  # Run name, auto-generated if None
       tags=[],  # List of tags for the run
       notes='',  # Notes for the run

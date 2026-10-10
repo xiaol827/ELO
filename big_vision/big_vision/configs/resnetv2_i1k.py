@@ -69,8 +69,8 @@ def get_config(arg=None):
 
   config.wandb = dict(
       enabled=True,
-      project='xiao_big_vision',
-      entity='eb-lab',  # Set to your wandb username/team, or None for default
+      project='<NEED>',
+      entity='<NEED>',  # Set to your wandb username/team, or None for default
       name='adam_v2resnet50',  # Run name, auto-generated if None
       tags=[],  # List of tags for the run
       notes='',  # Notes for the run

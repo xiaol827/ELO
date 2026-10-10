@@ -3,7 +3,7 @@ optimizer_args = dict(
     kwargs=dict(
         learning_rate=0.001,
         weight_decay=0.0,
-        checkpoint_path="/scratch/therien/l2o_install/celo2_checkpoint/theta.state",
+        checkpoint_path="<PATH_TO_CELO2_CHECKPOINT>/theta.state",
         orthogonalize=True,
     )
 )

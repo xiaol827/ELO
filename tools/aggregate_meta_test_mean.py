@@ -1,6 +1,6 @@
 """Aggregate per-ckpt meta-test runs into a single 'mean over tasks' summary run.
 
-Source: 36 runs in <NEED>/xiao-meta-testing-lossweight-sweep (9 ckpts x 4 tasks).
+Source: 36 runs in <NEED>/<NEED> (9 ckpts x 4 tasks).
 Group key: config.wandb_checkpoint_id (each ckpt has 4 task runs).
 Output: 9 new runs under group='summary' in the same project, name = "dirX.X_magY.Y",
 with per-step mean of all numeric metric columns across the 4 tasks.
@@ -57,9 +57,9 @@ def fetch_history_df(run) -> pd.DataFrame:
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--source_project", default="<NEED>/xiao-meta-testing-lossweight-sweep")
+    parser.add_argument("--source_project", default="<NEED>/<NEED>")
     parser.add_argument("--target_entity", default="<NEED>")
-    parser.add_argument("--target_project", default="xiao-meta-testing-lossweight-sweep")
+    parser.add_argument("--target_project", default="<NEED>")
     parser.add_argument("--group", default="summary")
     parser.add_argument("--dry_run", action="store_true")
     parser.add_argument("--overwrite", action="store_true",
