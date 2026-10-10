@@ -18,7 +18,7 @@
 - **Cheap to meta-train** — every ELO-LO is trained in under 7 GPU-hours
 
 <div align="center">
-  <img src="assets/meta_train_eff_with_lm.png" width="95%" alt="Left: ELO-Celo2 matches Muon and outperforms AdamW on GPT2 (350M) FineWeb pretraining. Right: ELO meta-training converges to lower meta-eval loss than other baselines.">
+  <img src="assets/elo_overview.png" width="95%" alt="ELO overview. Left: the failure-aware resume buffer pushes hard points and resumes inner problems from them, shifting meta-training compute from the early easy range to the late hard range under an identical compute budget. Right: progressive expert supervision blends expert and learned-optimizer trajectories with a weight that grows over meta-training, replacing high-variance meta-gradients from long unrolls with a stable imitation + exploitation signal.">
 </div>
 
 ## Usage in Pytorch
