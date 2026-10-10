@@ -14,7 +14,7 @@
 
 - **Resume buffer** — reallocates redundant meta-training compute toward longer failure regimes, scaling learned-optimizer meta-training to long inner problems.
 - **Progressive expert supervision** — enforces decoupled progressive expert supervision, providing stable meta-learning signals that additionally lead to generalizable LOs.
-- **Consistent downstream gains** — ELO-LOs substantially outperform their base LOs.
+- **Consistent downstream improvements** — ELO-LOs substantially outperform their base LOs.
 - **Cheap to meta-train** — every ELO-LO is trained in under 7 GPU-hours.
 
 <div align="center">
