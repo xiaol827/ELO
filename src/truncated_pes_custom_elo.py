@@ -136,6 +136,7 @@ def _push_buffers_core(
     snap_mean_max_cumsum,
     any_done,
     buffer_size,
+    snap_accumulator=None, accumulator_buffer=None,
 ):
   """Post-truncation push decision + buffer write (pure jnp/vmap).
 
@@ -158,6 +159,15 @@ def _push_buffers_core(
   new_neg_sb  = _write_per_task_if(n_state.state_buffer,      snap_neg_opt, slots, push)
   new_neg_tpb = _write_per_task_if(n_state.task_param_buffer, snap_neg_tp,  slots, push)
 
+  if accumulator_buffer is not None:
+    new_acc_buf = jax.lax.cond(
+        jnp.any(push),
+        lambda: _write_per_task_if(accumulator_buffer, snap_accumulator, slots,
+                                   push),
+        lambda: accumulator_buffer)
+  else:
+    new_acc_buf = None
+
   # Advance the write slot on trajectory end, not on push: the next full
   # unroll writes into a fresh slot.
   new_slots = jnp.where(any_done, (slots + 1) % buffer_size, slots)
@@ -167,6 +177,7 @@ def _push_buffers_core(
                       next_write_slot=new_slots),
       n_state.replace(state_buffer=new_neg_sb, task_param_buffer=new_neg_tpb,
                       next_write_slot=new_slots),
+      new_acc_buf,
   )
 
 
@@ -177,11 +188,41 @@ _push_buffers_pmap = jax.pmap(
     static_broadcasted_argnums=(8,))
 
 
+@jax.jit
+def _resolve_restart_accum(reset_slot_stack, accumulator_buffer):
+  num_tasks = reset_slot_stack.shape[1]
+  buffer_mask = reset_slot_stack >= 0
+  any_buffer = jnp.any(buffer_mask, axis=0)
+  step_ids = jnp.arange(reset_slot_stack.shape[0])[:, None]
+  last_step = jnp.maximum(
+      jnp.max(jnp.where(buffer_mask, step_ids, -1), axis=0), 0)
+  last_slot = jnp.where(
+      any_buffer, reset_slot_stack[last_step, jnp.arange(num_tasks)],
+      0).astype(jnp.int32)
+
+  def _gather_leaf(buf_leaf):
+    g = jax.vmap(
+        lambda b, s: jax.lax.dynamic_index_in_dim(b, s, axis=0,
+                                                  keepdims=False))(
+            buf_leaf, last_slot)
+    mask = any_buffer.reshape((num_tasks,) + (1,) * (g.ndim - 1))
+    return jnp.where(mask, g, jnp.zeros_like(g))
+
+  def _zeros_leaf(buf_leaf):
+    return jnp.zeros((num_tasks,) + buf_leaf.shape[2:], buf_leaf.dtype)
+
+  return jax.lax.cond(
+      jnp.any(any_buffer),
+      lambda: jax.tree_util.tree_map(_gather_leaf, accumulator_buffer),
+      lambda: jax.tree_util.tree_map(_zeros_leaf, accumulator_buffer))
+
+
 @flax.struct.dataclass
 class PESWorkerState(gradient_learner.GradientEstimatorState):
   pos_state: TruncatedUnrollState
   neg_state: TruncatedUnrollState
   accumulator: MetaParams
+  accumulator_buffer: Any = None
 
 @functools.partial(jax.jit, static_argnames=("std", "timer_obj", "sign_delta_loss_scalar", "samples_per_device", "device_idx", "imt_loss_type"))
 def compute_pes_grad(
@@ -198,6 +239,7 @@ def compute_pes_grad(
     samples_per_device: Optional[int] = None,
     device_idx: Optional[int] = None,
     imt_loss_type: str = "decoupled",
+    restart_accum: Optional[MetaParams] = None,
 ):
   """Compute the PES gradient estimate from the outputs of many unrolls.
 
@@ -270,6 +312,11 @@ def compute_pes_grad(
   # initially NON-ZERO for RNN and MLP
   accumulator = tree_utils.tree_add(vec_pos, accumulator)
 
+  if restart_accum is None:
+    post_reset_accum = vec_pos
+  else:
+    post_reset_accum = tree_utils.tree_add(restart_accum, vec_pos)
+
   num_tasks = last_unroll_loss.shape[0]
 
   def reshape_to(loss, p):
@@ -281,7 +328,7 @@ def compute_pes_grad(
 
   #initially zero for both RNN and MLP
   es_grad_from_new_perturb = jax.tree_util.tree_map(
-      functools.partial(reshape_to, new_unroll_loss), vec_pos)
+      functools.partial(reshape_to, new_unroll_loss), post_reset_accum)
 
   #initially zero for ONLY RNN and NOT MLP
   vec_es_grad = jax.tree_util.tree_map(lambda a, b: a + b, es_grad_from_accum,
@@ -297,7 +344,7 @@ def compute_pes_grad(
     shape = [num_tasks] + [1] * (len(a.shape) - 1)
     return jnp.where(jnp.reshape(has_finished[-1], shape), a, b)
 
-  new_accumulator = jax.tree_util.tree_map(_switch_one_accum, vec_pos,
+  new_accumulator = jax.tree_util.tree_map(_switch_one_accum, post_reset_accum,
                                            accumulator)
 
   pos_task_loss = jnp.sum(p_ys.task_loss * p_ys.mask, axis=0) / jnp.sum(p_ys.mask, axis=0)
@@ -311,7 +358,7 @@ def compute_pes_grad(
 @functools.partial(jax.jit, static_argnames=("std", "sign_delta_loss_scalar", "replicated", "imt_loss_type"))
 def _pes_grad_sharded_inner_elo(dirloss_weight, magloss_weight, p_ys, n_ys, accumulator, vec_pos, std,
                                 sign_delta_loss_scalar, replicated, delta_loss_scalar_afsnm=0.01,
-                                imt_loss_type="decoupled"):
+                                imt_loss_type="decoupled", restart_accum=None):
   """JIT-compiled inner function: all-gather via sharding constraint, then PES gradient (ELO variant)."""
   # All-gather: replicate all sharded arrays across devices
   p_ys = jax.tree_util.tree_map(
@@ -322,6 +369,9 @@ def _pes_grad_sharded_inner_elo(dirloss_weight, magloss_weight, p_ys, n_ys, accu
       lambda x: lax.with_sharding_constraint(x, replicated), accumulator)
   vec_pos = jax.tree_util.tree_map(
       lambda x: lax.with_sharding_constraint(x, replicated), vec_pos)
+  if restart_accum is not None:
+    restart_accum = jax.tree_util.tree_map(
+        lambda x: lax.with_sharding_constraint(x, replicated), restart_accum)
 
   # Separate direction and magnitude IMT losses, normalize each independently
   delta_direction_ori = p_ys.imt_cosine_loss - n_ys.imt_cosine_loss
@@ -364,6 +414,11 @@ def _pes_grad_sharded_inner_elo(dirloss_weight, magloss_weight, p_ys, n_ys, accu
 
   accumulator = tree_utils.tree_add(vec_pos, accumulator)
 
+  if restart_accum is None:
+    post_reset_accum = vec_pos
+  else:
+    post_reset_accum = tree_utils.tree_add(restart_accum, vec_pos)
+
   num_tasks = last_unroll_loss.shape[0]
 
   def reshape_to(loss, p):
@@ -373,7 +428,7 @@ def _pes_grad_sharded_inner_elo(dirloss_weight, magloss_weight, p_ys, n_ys, accu
       functools.partial(reshape_to, last_unroll_loss), accumulator)
 
   es_grad_from_new_perturb = jax.tree_util.tree_map(
-      functools.partial(reshape_to, new_unroll_loss), vec_pos)
+      functools.partial(reshape_to, new_unroll_loss), post_reset_accum)
 
   vec_es_grad = jax.tree_util.tree_map(lambda a, b: a + b, es_grad_from_accum,
                                        es_grad_from_new_perturb)
@@ -389,7 +444,7 @@ def _pes_grad_sharded_inner_elo(dirloss_weight, magloss_weight, p_ys, n_ys, accu
     shape = [num_tasks] + [1] * (len(a.shape) - 1)
     return jnp.where(jnp.reshape(has_finished[-1], shape), a, b)
 
-  new_accumulator = jax.tree_util.tree_map(_switch_one_accum, vec_pos,
+  new_accumulator = jax.tree_util.tree_map(_switch_one_accum, post_reset_accum,
                                            accumulator)
 
   pos_task_loss = jnp.sum(p_ys.task_loss * p_ys.mask, axis=0) / jnp.sum(p_ys.mask, axis=0)
@@ -429,6 +484,7 @@ def compute_pes_grad_sharded_elo(
     delta_loss_scalar_afsnm: Optional[float] = 0.01,
     imt_loss_type: str = "decoupled",
     mesh: Optional[Mesh] = None,
+    restart_accum: Optional[MetaParams] = None,
 ):
   """Compute PES gradient using JAX mesh-based sharding for multi-GPU all-gather (ELO variant).
 
@@ -484,6 +540,8 @@ def compute_pes_grad_sharded_elo(
     n_ys = jax.tree_util.tree_map(make_global_axis1, n_ys)
     accumulator = jax.tree_util.tree_map(make_global_axis0, accumulator)
     vec_pos = jax.tree_util.tree_map(make_global_axis0, vec_pos)
+    if restart_accum is not None:
+      restart_accum = jax.tree_util.tree_map(make_global_axis0, restart_accum)
     dirloss_weight = make_global_replicated_scalar(dirloss_weight)
     magloss_weight = make_global_replicated_scalar(magloss_weight)
 
@@ -497,6 +555,7 @@ def compute_pes_grad_sharded_elo(
       replicated=replicated,
       delta_loss_scalar_afsnm=delta_loss_scalar_afsnm,
       imt_loss_type=imt_loss_type,
+      restart_accum=restart_accum,
   )
 
   # Per-device slicing: extract this process's portion of per-task outputs
@@ -642,14 +701,21 @@ class TruncatedPES_ELO(gradient_learner.GradientEstimator):
         theta, worker_weights.outer_state, key, theta_is_vector=False)
     neg_unroll_state = pos_unroll_state
 
+    num_tasks = self.truncated_step.num_tasks
     accumulator = jax.tree_util.tree_map(
-        lambda x: jnp.zeros([self.truncated_step.num_tasks] + list(x.shape)),
+        lambda x: jnp.zeros([num_tasks] + list(x.shape)),
+        theta)
+    buffer_size = jax.tree_util.tree_leaves(
+        pos_unroll_state.state_buffer)[0].shape[1]
+    accumulator_buffer = jax.tree_util.tree_map(
+        lambda x: jnp.zeros([num_tasks, buffer_size] + list(x.shape)),
         theta)
 
     return PESWorkerState(
         pos_state=pos_unroll_state,
         neg_state=neg_unroll_state,
-        accumulator=accumulator)
+        accumulator=accumulator,
+        accumulator_buffer=accumulator_buffer)
 
   @profile.wrap()
   def get_datas(self):
@@ -679,6 +745,7 @@ class TruncatedPES_ELO(gradient_learner.GradientEstimator):
     p_state = state.pos_state
     n_state = state.neg_state
     accumulator = state.accumulator
+    accumulator_buffer = state.accumulator_buffer
     rng = hk.PRNGSequence(key)
 
     # Snapshot pre-truncation inner_opt_state / task_param / mean(max_cumsum)
@@ -748,12 +815,16 @@ class TruncatedPES_ELO(gradient_learner.GradientEstimator):
     buffer_size = jax.tree_util.tree_leaves(p_state.state_buffer)[0].shape[1]
     any_done = (jnp.any(jnp.stack([y.is_done for y in p_yses]), axis=(0, 1))
                 | jnp.any(jnp.stack([y.is_done for y in n_yses]), axis=(0, 1)))
-    p_state, n_state = _push_buffers_jit(
+    reset_slot_stack = jnp.concatenate([y.reset_slot for y in p_yses], axis=0)
+    restart_accum = _resolve_restart_accum(reset_slot_stack, accumulator_buffer)
+
+    p_state, n_state, accumulator_buffer = _push_buffers_jit(
         p_state, n_state,
         snap_pos_opt, snap_pos_tp, snap_neg_opt, snap_neg_tp,
         snap_mean_max_cumsum,
         any_done,
-        buffer_size)
+        buffer_size,
+        snap_accumulator=accumulator, accumulator_buffer=accumulator_buffer)
 
     if self.use_bc_grads:
       # Convert lists of gradients to stacked arrays
@@ -787,7 +858,8 @@ class TruncatedPES_ELO(gradient_learner.GradientEstimator):
         self.timer_obj,
         sign_delta_loss_scalar=self.sign_delta_loss_scalar,
         samples_per_device=self.samples_per_device,
-        device_idx=jax.process_index())
+        device_idx=jax.process_index(),
+        restart_accum=restart_accum)
 
     unroll_info = gradient_learner.UnrollInfo(
         loss=p_ys.task_loss,
@@ -799,7 +871,8 @@ class TruncatedPES_ELO(gradient_learner.GradientEstimator):
         mean_loss=loss,
         grad=es_grad,
         bc_grad=mean_bc_grads,
-        unroll_state=PESWorkerState(p_state, n_state, new_accumulator),
+        unroll_state=PESWorkerState(p_state, n_state, new_accumulator,
+                                    accumulator_buffer=accumulator_buffer),
         unroll_info=unroll_info)
 
     metrics = summary.aggregate_metric_list(
@@ -1004,7 +1077,7 @@ class TruncatedPESPMAP_ELO(TruncatedPES_ELO):
     buffer_size = jax.tree_util.tree_leaves(p_state.state_buffer)[0].shape[2]
     any_done = (jnp.any(jnp.concatenate([y.is_done for y in p_yses], axis=1), axis=1)
                 | jnp.any(jnp.concatenate([y.is_done for y in n_yses], axis=1), axis=1))
-    p_state, n_state = _push_buffers_pmap(
+    p_state, n_state, _ = _push_buffers_pmap(
         p_state, n_state,
         snap_pos_opt, snap_pos_tp, snap_neg_opt, snap_neg_tp,
         snap_mean_max_cumsum,
